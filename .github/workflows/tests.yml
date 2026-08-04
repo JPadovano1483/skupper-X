@@ -76,7 +76,7 @@ jobs:
           helmfile version
 
       - name: Install helm-diff plugin
-        run: helm plugin install https://github.com/databus23/helm-diff
+        run: helm plugin install --verify=false https://github.com/databus23/helm-diff
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
