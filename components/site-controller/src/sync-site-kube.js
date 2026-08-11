@@ -59,6 +59,7 @@ import {
     DeleteConfigmap,
     DeleteDeployment,
     LoadSecret,
+    ReplaceSecret,
     LoadConfigmap,
     UpdateLink,
     UpdateNetworkAccess,
@@ -242,6 +243,9 @@ const onPeerLost = async function (_peerId) {
 
 const retrieveLatest = async function (apiVersion, objKind, objName) {
     Log(`Retrieving latest object - kind: ${apiVersion}.${objKind}, name: ${objName}`);
+    if (apiVersion == "v1" && objKind == "Secret") {
+        return await LoadSecret(objName);
+    }
     if (apiVersion == "skupper.io/v2alpha1") {
         try {
             switch (objKind) {
@@ -270,6 +274,9 @@ const updateObject = async function (obj) {
     const objKind = obj.kind;
     const objName = obj.metadata.name;
     Log(`Updating object - kind: ${apiVersion}.${objKind}, name: ${objName}`);
+    if (apiVersion == "v1" && objKind == "Secret") {
+        return await ReplaceSecret(objName, obj);
+    }
     if (apiVersion == "skupper.io/v2alpha1") {
         switch (objKind) {
             case "Link":
