@@ -42,6 +42,8 @@ import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 
+const lastObservedSecretResourceVersion = {};
+
 //
 // When new management controllers are created, add a certificate request.
 //
@@ -720,18 +722,93 @@ async function secretAdded(dblink, secret) {
 }
 
 //
+// A managed secret tied to an existing TlsCertificate has been renewed in place.
+// Update cert metadata and trigger downstream sync propagation.
+//
+async function secretRenewed(dblink, secret) {
+    const client = await ClientFromPool("system");
+    const notify = new NotifyTransaction();
+    try {
+        await client.query("BEGIN");
+        const certResult = await client.query(
+            "SELECT Id FROM TlsCertificates WHERE Id = $1 AND ObjectName = $2",
+            [dblink, secret.metadata.name]
+        );
+        if (certResult.rowCount == 1) {
+            const cert_object = await LoadCertificate(secret.metadata.name);
+            const expiration = cert_object.status?.notAfter
+                ? new Date(cert_object.status.notAfter)
+                : undefined;
+            const renewal = cert_object.status?.renewalTime
+                ? new Date(cert_object.status.renewalTime)
+                : undefined;
+            await client.query(
+                "UPDATE TlsCertificates SET Expiration = $1, RenewalTime = $2 WHERE Id = $3",
+                [expiration, renewal, dblink]
+            );
+            notify.update("TlsCertificates", dblink);
+            await client.query("COMMIT");
+            await notify.commit();
+            await SiteCertificateChanged(dblink);
+            await AccessCertificateChanged(dblink);
+        }
+    } catch (err) {
+        Log(`Rolling back secret-renewed transaction: ${err.stack}`);
+        await client.query("ROLLBACK");
+    } finally {
+        client.release();
+    }
+}
+
+function shouldProcessSecretModification(dblink, resourceVersion) {
+    if (!resourceVersion) {
+        return true;
+    }
+    const previous = lastObservedSecretResourceVersion[dblink];
+    if (!previous) {
+        lastObservedSecretResourceVersion[dblink] = resourceVersion;
+        return true;
+    }
+    try {
+        const currentInt = BigInt(resourceVersion);
+        const previousInt = BigInt(previous);
+        if (currentInt > previousInt) {
+            lastObservedSecretResourceVersion[dblink] = resourceVersion;
+            return true;
+        }
+        return false;
+    } catch {
+        if (resourceVersion !== previous) {
+            lastObservedSecretResourceVersion[dblink] = resourceVersion;
+            return true;
+        }
+        return false;
+    }
+}
+
+//
 // Handle watch events on Secrets
 //
 const onSecretWatch = function (action, secret) {
+    const anno = secret.metadata.annotations;
+    if (anno?.[META_ANNOTATION_VMS_CONTROLLED] != "true") {
+        return;
+    }
+    const dblink = anno["skupper.io/vms-dblink"];
+    if (!dblink) {
+        return;
+    }
     switch (action) {
-        case "ADDED": {
-            const anno = secret.metadata.annotations;
-            if (anno?.[META_ANNOTATION_VMS_CONTROLLED] == "true") {
-                const dblink = anno["skupper.io/vms-dblink"];
-                if (dblink) {
-                    secretAdded(dblink, secret);
+        case "ADDED":
+            secretAdded(dblink, secret);
+            break;
+        case "MODIFIED": {
+            if (shouldProcessSecretModification(dblink, secret.metadata.resourceVersion)) {
+                if (secret.data) {
+                    secretRenewed(dblink, secret);
                 }
             }
+            break;
         }
     }
 };
