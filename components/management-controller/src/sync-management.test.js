@@ -231,6 +231,36 @@ describe("SiteCertificateChanged", () => {
         expect(LoadSecret).not.toHaveBeenCalled();
         expect(UpdateLocalState).not.toHaveBeenCalled();
     });
+
+    it("updates tls-site state hash for connected member sites", async () => {
+        _registerPeerForTest("member-1", "member");
+
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("FROM InteriorSites") && sql.includes("UNION")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ id: "member-1", objectname: "member-tls-secret" }],
+                };
+            }
+            return { rows: [] };
+        });
+
+        LoadSecret.mockResolvedValue({
+            data: { "tls.crt": Buffer.from("member-cert").toString("base64") },
+        });
+
+        await SiteCertificateChanged("cert-member-1");
+
+        expect(LoadSecret).toHaveBeenCalledWith("member-tls-secret");
+        expect(UpdateLocalState).toHaveBeenCalledWith(
+            "member-1",
+            "tls-site-member-1",
+            expect.stringMatching(/^[a-f0-9]{40}$/)
+        );
+    });
 });
 
 describe("SiteIngressChanged", () => {

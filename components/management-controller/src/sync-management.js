@@ -719,16 +719,20 @@ export async function SiteCertificateChanged(certId) {
         const result = await client.query(
             "SELECT InteriorSites.Id, TlsCertificates.ObjectName FROM InteriorSites " +
                 "JOIN TlsCertificates ON TlsCertificates.Id = InteriorSites.Certificate " +
+                "WHERE Certificate = $1 " +
+                "UNION " +
+                "SELECT MemberSites.Id, TlsCertificates.ObjectName FROM MemberSites " +
+                "JOIN TlsCertificates ON TlsCertificates.Id = MemberSites.Certificate " +
                 "WHERE Certificate = $1",
             [certId]
         );
-        if (result.rowCount == 1) {
-            const site = result.rows[0];
-            if (peers[site.id]) {
-                const secret = await LoadSecret(site.objectname);
-                const hash = HashOfSecret(secret);
-                await UpdateLocalState(site.id, `tls-site-${site.id}`, hash);
+        for (const site of result.rows) {
+            if (!peers[site.id]) {
+                continue;
             }
+            const secret = await LoadSecret(site.objectname);
+            const hash = HashOfSecret(secret);
+            await UpdateLocalState(site.id, `tls-site-${site.id}`, hash);
         }
         await client.query("COMMIT");
     } catch (error) {

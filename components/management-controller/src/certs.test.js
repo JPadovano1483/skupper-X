@@ -26,6 +26,7 @@ const mockClient = {
 
 /** @type {Record<string, Function>} */
 const notificationHandlers = {};
+let secretWatchHandler;
 
 /** @type {Array<{ method: string, table: string, id: string }>} */
 const notifyEvents = [];
@@ -33,7 +34,9 @@ const notifyEvents = [];
 vi.mock("@vms/modules/kube", () => ({
     ApplyObject: vi.fn(),
     LoadCertificate: vi.fn(),
-    WatchSecrets: vi.fn(),
+    WatchSecrets: vi.fn((handler) => {
+        secretWatchHandler = handler;
+    }),
     WatchCertificates: vi.fn(),
     GetIssuers: vi.fn(async () => []),
 }));
@@ -90,7 +93,8 @@ vi.mock("./notify.js", () => ({
 
 import { Start } from "./certs.js";
 import { RegisterNotification } from "./notify.js";
-import { ApplyObject } from "@vms/modules/kube";
+import { ApplyObject, LoadCertificate } from "@vms/modules/kube";
+import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
 
 function transactionSql(sql) {
     return sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK";
@@ -101,6 +105,7 @@ describe("certs Start", () => {
         vi.clearAllMocks();
         mockClient.query.mockReset();
         notifyEvents.length = 0;
+        secretWatchHandler = undefined;
         for (const key of Object.keys(notificationHandlers)) {
             delete notificationHandlers[key];
         }
@@ -554,6 +559,59 @@ describe("onInteriorSitesChange", () => {
             method: "add",
             table: "CertificateRequests",
             id: "cert-req-site-1",
+        });
+    });
+});
+
+describe("onSecretWatch", () => {
+    beforeEach(async () => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        notifyEvents.length = 0;
+        secretWatchHandler = undefined;
+        for (const key of Object.keys(notificationHandlers)) {
+            delete notificationHandlers[key];
+        }
+        await Start();
+    });
+
+    it("propagates secret MODIFIED renewals for managed certs", async () => {
+        LoadCertificate.mockResolvedValue({
+            status: {
+                notAfter: "2026-10-12T12:00:00.000Z",
+                renewalTime: "2026-10-11T12:00:00.000Z",
+            },
+        });
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("SELECT Id FROM TlsCertificates WHERE Id = $1 AND ObjectName = $2")) {
+                return { rowCount: 1, rows: [{ id: "cert-1" }] };
+            }
+            if (sql.includes("UPDATE TlsCertificates SET Expiration = $1, RenewalTime = $2")) {
+                return {};
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        secretWatchHandler("MODIFIED", {
+            metadata: {
+                name: "vms-interior-cert-1",
+                resourceVersion: "42",
+                annotations: {
+                    "skupper.io/vms-controlled": "true",
+                    "skupper.io/vms-dblink": "cert-1",
+                },
+            },
+            data: {
+                "tls.crt": "base64-cert",
+            },
+        });
+
+        await vi.waitFor(() => {
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-1");
+            expect(AccessCertificateChanged).toHaveBeenCalledWith("cert-1");
         });
     });
 });
