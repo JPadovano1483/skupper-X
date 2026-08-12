@@ -30,6 +30,7 @@ import { OpenConnection, CloseConnection } from "@vms/modules/amqp";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 
 let controller_name;
+let controller_certificate_id;
 let tls_ca;
 let tls_cert;
 let tls_key;
@@ -119,8 +120,8 @@ async function reconcileBackboneConnections() {
     }
 }
 
-async function resolveTLSData() {
-    let reschedule_delay = 1000;
+async function resolveTLSData(renewal = false) {
+    let reschedule_delay = renewal ? -1 : 1000;
     const client = await ClientFromPool("system");
     try {
         await client.query("BEGIN");
@@ -129,9 +130,10 @@ async function resolveTLSData() {
             [controller_name]
         );
         if (result.rowCount == 1) {
+            controller_certificate_id = result.rows[0].certificate;
             const tls_result = await client.query(
                 "SELECT ObjectName FROM TlsCertificates WHERE Id = $1",
-                [result.rows[0].certificate]
+                [controller_certificate_id]
             );
             if (tls_result.rowCount == 1) {
                 const secret = await LoadSecret(tls_result.rows[0].objectname);
@@ -155,8 +157,12 @@ async function resolveTLSData() {
                     );
                 }
 
-                reschedule_delay = -1;
-                setTimeout(reconcileBackboneConnections, 0);
+                if (renewal) {
+                    await reconcileBackboneConnections();
+                } else {
+                    reschedule_delay = -1;
+                    setTimeout(reconcileBackboneConnections, 0);
+                }
             } else {
                 throw new Error(
                     `Expected to find a TlsCertificate record for ready controller: ${result.rows[0].certificate}`
@@ -167,10 +173,12 @@ async function resolveTLSData() {
     } catch (err) {
         Log(`Rolling back resolveTLSData transaction: ${err.stack}`);
         await client.query("ROLLBACK");
-        reschedule_delay = 10000;
+        if (!renewal) {
+            reschedule_delay = 10000;
+        }
     } finally {
         client.release();
-        if (reschedule_delay >= 0) {
+        if (!renewal && reschedule_delay >= 0) {
             setTimeout(resolveTLSData, reschedule_delay);
         }
     }
@@ -216,6 +224,17 @@ async function onAccessPointChange(action, id) {
     }
 }
 
+async function onTlsCertificateChange(action, id) {
+    if (action != "UPDATE" || id != controller_certificate_id || !tls_cert) {
+        return;
+    }
+    Log(`Management controller TLS certificate renewed (${id}), reloading AMQP connections`);
+    for (const apid of Object.keys(manageConnections)) {
+        await deleteConnection(apid);
+    }
+    await resolveTLSData(true);
+}
+
 export async function RegisterHandler(onAdded, onDeleted) {
     for (const [key, value] of Object.entries(manageConnections)) {
         await onAdded(key, value.conn);
@@ -232,5 +251,6 @@ export async function Start(name) {
     controller_name = name;
     await resolveControllerRecord();
     RegisterNotification("BackboneAccessPoints", onAccessPointChange, false);
+    RegisterNotification("TlsCertificates", onTlsCertificateChange, false);
     setTimeout(periodicCheck, 5000);
 }
