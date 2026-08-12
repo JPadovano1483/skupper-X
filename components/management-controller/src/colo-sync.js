@@ -280,6 +280,22 @@ async function runTheVisitQueue() {
     }
 }
 
+async function syncTlsSecretInNamespace(ns, secretName, mcSecretName, inject) {
+    const mcSecret = await kube.LoadSecret(mcSecretName);
+    if (!mcSecret) {
+        return;
+    }
+    const resource = resourceTemplates.Secret(mcSecret, secretName, inject);
+    const coloSecret = await kube.LoadSecret(secretName, ns);
+    if (!coloSecret) {
+        await kube.ApplyObject(resource, ns);
+    } else if (
+        resourceTemplates.HashOfSecret(coloSecret) !== resourceTemplates.HashOfSecret(mcSecret)
+    ) {
+        await kube.ReplaceSecret(secretName, resource, ns);
+    }
+}
+
 async function doVisitNamespace(ns) {
     //
     // Conditions to ensure, in order:
@@ -363,25 +379,19 @@ async function doVisitNamespace(ns) {
         //
         // Ensure that if the site record is in READY or ACTIVE state, the site certificate is installed in namespace (else apply it)
         //
-        // TODO: Check the contents of the secret to see if it needs to be updated (for certificate rotation)
-        //
         if (["ready", "active"].includes(coloNamespaces[ns].site.lifecycle)) {
             const siteSecretName = `vms-site-${coloNamespaces[ns].site.id}`;
-            const siteSecret = await kube.LoadSecret(siteSecretName, ns);
-            if (!siteSecret) {
-                const cert = await client
-                    .query("SELECT objectname FROM TlsCertificates WHERE Id = $1", [
-                        coloNamespaces[ns].site.certificate,
-                    ])
-                    .then((res) => res.rows[0]);
-                const secret = await kube.LoadSecret(cert.objectname);
-                const resource = resourceTemplates.Secret(
-                    secret,
-                    siteSecretName,
-                    common.INJECT_TYPE_SITE
-                );
-                await kube.ApplyObject(resource, ns);
-            }
+            const cert = await client
+                .query("SELECT objectname FROM TlsCertificates WHERE Id = $1", [
+                    coloNamespaces[ns].site.certificate,
+                ])
+                .then((res) => res.rows[0]);
+            await syncTlsSecretInNamespace(
+                ns,
+                siteSecretName,
+                cert.objectname,
+                common.INJECT_TYPE_SITE
+            );
         }
 
         //
@@ -417,17 +427,12 @@ async function doVisitNamespace(ns) {
         // Ensure that if accesspoint is in READY state, the server certificate is installed in namespace (else apply it)
         //
         if (coloNamespaces[ns].accesspoint.lifecycle === "ready") {
-            const apSecret = await kube.LoadSecret(apSecretName, ns);
-            if (!apSecret) {
-                const cert = await client
-                    .query("SELECT objectname FROM TlsCertificates WHERE Id = $1", [
-                        coloNamespaces[ns].accesspoint.certificate,
-                    ])
-                    .then((res) => res.rows[0]);
-                const secret = await kube.LoadSecret(cert.objectname);
-                const resource = resourceTemplates.Secret(secret, apSecretName);
-                await kube.ApplyObject(resource, ns);
-            }
+            const cert = await client
+                .query("SELECT objectname FROM TlsCertificates WHERE Id = $1", [
+                    coloNamespaces[ns].accesspoint.certificate,
+                ])
+                .then((res) => res.rows[0]);
+            await syncTlsSecretInNamespace(ns, apSecretName, cert.objectname);
         }
 
         await client.query("COMMIT");
