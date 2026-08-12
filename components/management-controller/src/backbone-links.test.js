@@ -46,8 +46,54 @@ vi.mock("./notify.js", () => ({
 }));
 
 import { LoadSecret } from "@vms/modules/kube";
-import { OpenConnection } from "@vms/modules/amqp";
+import { OpenConnection, CloseConnection } from "@vms/modules/amqp";
 import { RegisterNotification } from "./notify.js";
+
+const notificationHandlers = {};
+
+function mockReadyControllerQueries(overrides = {}) {
+    const certificateId = overrides.certificateId ?? "cert-1";
+    const secretName = overrides.secretName ?? "tls-secret";
+    return async (sql) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+            return {};
+        }
+        if (sql.includes("SELECT * FROM ManagementControllers WHERE Name = $1 and LifeCycle")) {
+            return {
+                rowCount: 1,
+                rows: [{ name: "test-controller", certificate: certificateId }],
+            };
+        }
+        if (sql.includes("SELECT * FROM ManagementControllers WHERE Name")) {
+            return {
+                rowCount: 1,
+                rows: [{ name: "test-controller", certificate: certificateId }],
+            };
+        }
+        if (sql.includes("SELECT ObjectName FROM TlsCertificates")) {
+            return { rowCount: 1, rows: [{ objectname: secretName }] };
+        }
+        if (sql.includes("BackboneAccessPoints AS ap")) {
+            return {
+                rows: [
+                    {
+                        id: "ap-1",
+                        hostname: "router.example.com",
+                        port: 5671,
+                        colocated: false,
+                    },
+                ],
+            };
+        }
+        return { rows: [] };
+    };
+}
+
+function captureNotificationHandlers() {
+    RegisterNotification.mockImplementation((tableName, handler) => {
+        notificationHandlers[tableName] = handler;
+    });
+}
 
 describe("RegisterHandler", () => {
     let Start;
@@ -57,6 +103,10 @@ describe("RegisterHandler", () => {
         vi.useFakeTimers();
         vi.clearAllMocks();
         mockClient.query.mockReset();
+        for (const key of Object.keys(notificationHandlers)) {
+            delete notificationHandlers[key];
+        }
+        captureNotificationHandlers();
         vi.resetModules();
         ({ Start, RegisterHandler } = await import("./backbone-links.js"));
     });
@@ -77,39 +127,7 @@ describe("RegisterHandler", () => {
             },
         });
 
-        mockClient.query.mockImplementation(async (sql) => {
-            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
-                return {};
-            }
-            if (sql.includes("SELECT * FROM ManagementControllers WHERE Name = $1 and LifeCycle")) {
-                return {
-                    rowCount: 1,
-                    rows: [{ name: "test-controller", certificate: "cert-1" }],
-                };
-            }
-            if (sql.includes("SELECT * FROM ManagementControllers WHERE Name")) {
-                return {
-                    rowCount: 1,
-                    rows: [{ name: "test-controller", certificate: "cert-1" }],
-                };
-            }
-            if (sql.includes("SELECT ObjectName FROM TlsCertificates")) {
-                return { rowCount: 1, rows: [{ objectname: "tls-secret" }] };
-            }
-            if (sql.includes("BackboneAccessPoints AS ap")) {
-                return {
-                    rows: [
-                        {
-                            id: "ap-1",
-                            hostname: "router.example.com",
-                            port: 5671,
-                            colocated: false,
-                        },
-                    ],
-                };
-            }
-            return { rows: [] };
-        });
+        mockClient.query.mockImplementation(mockReadyControllerQueries());
 
         await Start("test-controller");
         await vi.runOnlyPendingTimersAsync();
@@ -129,6 +147,10 @@ describe("resolveControllerRecord (via Start)", () => {
         vi.useFakeTimers();
         vi.clearAllMocks();
         mockClient.query.mockReset();
+        for (const key of Object.keys(notificationHandlers)) {
+            delete notificationHandlers[key];
+        }
+        captureNotificationHandlers();
         vi.resetModules();
         ({ Start } = await import("./backbone-links.js"));
     });
@@ -160,6 +182,11 @@ describe("resolveControllerRecord (via Start)", () => {
         expect(mockClient.release).toHaveBeenCalled();
         expect(RegisterNotification).toHaveBeenCalledWith(
             "BackboneAccessPoints",
+            expect.any(Function),
+            false
+        );
+        expect(RegisterNotification).toHaveBeenCalledWith(
+            "TlsCertificates",
             expect.any(Function),
             false
         );
@@ -220,39 +247,7 @@ describe("resolveControllerRecord (via Start)", () => {
             },
         });
 
-        mockClient.query.mockImplementation(async (sql) => {
-            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
-                return {};
-            }
-            if (sql.includes("SELECT * FROM ManagementControllers WHERE Name = $1 and LifeCycle")) {
-                return {
-                    rowCount: 1,
-                    rows: [{ name: "test-controller", certificate: "cert-1" }],
-                };
-            }
-            if (sql.includes("SELECT * FROM ManagementControllers WHERE Name")) {
-                return {
-                    rowCount: 1,
-                    rows: [{ name: "test-controller", certificate: "cert-1" }],
-                };
-            }
-            if (sql.includes("SELECT ObjectName FROM TlsCertificates")) {
-                return { rowCount: 1, rows: [{ objectname: "tls-secret" }] };
-            }
-            if (sql.includes("BackboneAccessPoints AS ap")) {
-                return {
-                    rows: [
-                        {
-                            id: "ap-1",
-                            hostname: "router.example.com",
-                            port: 5671,
-                            colocated: false,
-                        },
-                    ],
-                };
-            }
-            return { rows: [] };
-        });
+        mockClient.query.mockImplementation(mockReadyControllerQueries());
 
         await Start("test-controller");
         await vi.runOnlyPendingTimersAsync();
@@ -269,5 +264,93 @@ describe("resolveControllerRecord (via Start)", () => {
             expect.any(Buffer)
         );
         expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
+    });
+});
+
+describe("onTlsCertificateChange (via Start)", () => {
+    let Start;
+
+    beforeEach(async () => {
+        vi.useFakeTimers();
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        for (const key of Object.keys(notificationHandlers)) {
+            delete notificationHandlers[key];
+        }
+        captureNotificationHandlers();
+        vi.resetModules();
+        ({ Start } = await import("./backbone-links.js"));
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it("reloads TLS and reconnects manage AMQP when the management controller cert is renewed", async () => {
+        LoadSecret.mockResolvedValue({
+            data: {
+                "ca.crt": Buffer.from("ca").toString("base64"),
+                "tls.crt": Buffer.from("cert").toString("base64"),
+                "tls.key": Buffer.from("key").toString("base64"),
+            },
+        });
+
+        mockClient.query.mockImplementation(mockReadyControllerQueries());
+
+        await Start("test-controller");
+        await vi.runOnlyPendingTimersAsync();
+        await vi.runOnlyPendingTimersAsync();
+
+        expect(OpenConnection).toHaveBeenCalledTimes(1);
+        CloseConnection.mockClear();
+        OpenConnection.mockClear();
+        LoadSecret.mockClear();
+        LoadSecret.mockResolvedValue({
+            data: {
+                "ca.crt": Buffer.from("new-ca").toString("base64"),
+                "tls.crt": Buffer.from("new-cert").toString("base64"),
+                "tls.key": Buffer.from("new-key").toString("base64"),
+            },
+        });
+
+        await notificationHandlers.TlsCertificates("UPDATE", "cert-1");
+
+        expect(CloseConnection).toHaveBeenCalledWith({ id: "mock-conn" });
+        expect(LoadSecret).toHaveBeenCalledWith("tls-secret");
+        expect(OpenConnection).toHaveBeenCalledWith(
+            "Backbone-management-ap-1",
+            "router.example.com",
+            5671,
+            "tls",
+            Buffer.from("new-ca"),
+            Buffer.from("new-cert"),
+            Buffer.from("new-key")
+        );
+    });
+
+    it("ignores TlsCertificates UPDATE for unrelated certs", async () => {
+        LoadSecret.mockResolvedValue({
+            data: {
+                "ca.crt": Buffer.from("ca").toString("base64"),
+                "tls.crt": Buffer.from("cert").toString("base64"),
+                "tls.key": Buffer.from("key").toString("base64"),
+            },
+        });
+
+        mockClient.query.mockImplementation(mockReadyControllerQueries());
+
+        await Start("test-controller");
+        await vi.runOnlyPendingTimersAsync();
+        await vi.runOnlyPendingTimersAsync();
+
+        CloseConnection.mockClear();
+        LoadSecret.mockClear();
+        OpenConnection.mockClear();
+
+        await notificationHandlers.TlsCertificates("UPDATE", "other-cert");
+
+        expect(CloseConnection).not.toHaveBeenCalled();
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(OpenConnection).not.toHaveBeenCalled();
     });
 });
