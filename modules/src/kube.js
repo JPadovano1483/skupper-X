@@ -175,10 +175,10 @@ export async function LoadSecret(name, ns) {
     }
 }
 
-export async function ReplaceSecret(name, obj) {
+export async function ReplaceSecret(name, obj, ns) {
     await v1Api.replaceNamespacedSecret({
         name: name,
-        namespace: namespace,
+        namespace: ns || namespace,
         body: obj,
     });
 }
