@@ -168,7 +168,7 @@ const processClaim = async function (claimId, name) {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT * FROM MemberInvitations WHERE Id = $1 and (JoinDeadline IS NULL OR JoinDeadline > now())",
+            "SELECT * FROM MemberInvitations WHERE Id = $1 AND LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
             [claimId]
         );
         if (result.rowCount != 1) {
@@ -342,3 +342,6 @@ export function _registerMemberCompletionForTest(memberId, { callback } = {}) {
         callback,
     };
 }
+
+/** @internal Exported for unit tests */
+export { processClaim as _processClaimForTest };

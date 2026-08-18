@@ -361,6 +361,7 @@ const getCertsSignedBy = async function (req, res) {
     const client = await ClientFromPool();
     try {
         const ca = req.query.signedby;
+        const expiresWithinDays = util.parseExpiresWithinDays(req.query.expiresWithin);
         if (ca && !util.IsValidUuid(ca)) {
             throw new Error(`Malformed signedby reference: ${ca}`);
         }
@@ -373,11 +374,17 @@ const getCertsSignedBy = async function (req, res) {
                 if (ca_result.rowCount == 0 || !ca_result.rows[0].isca) {
                     throw new Error(`signedby certificate is not an issuer`);
                 }
-                return await client.query("SELECT * FROM tlsCertificates WHERE signedBy = $1", [
-                    ca,
-                ]);
             }
-            return await client.query("SELECT * FROM tlsCertificates WHERE signedBy IS NULL");
+            let sql = ca
+                ? "SELECT * FROM tlsCertificates WHERE signedBy = $1"
+                : "SELECT * FROM tlsCertificates WHERE signedBy IS NULL";
+            const params = ca ? [ca] : [];
+            if (expiresWithinDays !== undefined) {
+                const expiresParam = params.length + 1;
+                sql += ` AND expiration IS NOT NULL AND expiration <= NOW() + ($${expiresParam}::integer * INTERVAL '1 day')`;
+                params.push(expiresWithinDays);
+            }
+            return await client.query(sql, params);
         });
         res.status(returnStatus).json(result.rows);
     } catch (err) {

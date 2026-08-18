@@ -18,7 +18,13 @@
 */
 
 import { describe, it, expect } from "vitest";
-import { IsValidUuid, ValidateAndNormalizeFields, UniquifyName, ToYaml } from "./util.js";
+import {
+    IsValidUuid,
+    ValidateAndNormalizeFields,
+    UniquifyName,
+    ToYaml,
+    parseExpiresWithinDays,
+} from "./util.js";
 
 describe("IsValidUuid", () => {
     it("accepts lowercase uuid", () => {
@@ -79,5 +85,23 @@ describe("ToYaml", () => {
     it("joins array entries with document separator", () => {
         const yaml = ToYaml([{ a: 1 }, { b: 2 }]);
         expect(yaml).toContain("---");
+    });
+});
+
+describe("parseExpiresWithinDays", () => {
+    it("returns undefined when the query param is absent", () => {
+        expect(parseExpiresWithinDays(undefined)).toBeUndefined();
+        expect(parseExpiresWithinDays("")).toBeUndefined();
+    });
+
+    it("parses a positive integer", () => {
+        expect(parseExpiresWithinDays("30")).toBe(30);
+        expect(parseExpiresWithinDays(["7"])).toBe(7);
+    });
+
+    it("rejects invalid values", () => {
+        expect(() => parseExpiresWithinDays("0")).toThrow(/positive integer/);
+        expect(() => parseExpiresWithinDays("-1")).toThrow(/positive integer/);
+        expect(() => parseExpiresWithinDays("abc")).toThrow(/positive integer/);
     });
 });

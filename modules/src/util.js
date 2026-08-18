@@ -210,3 +210,21 @@ export function ToYaml(input) {
     }
     return dump(input);
 }
+
+/**
+ * Parse an optional API query value for certs expiring within N days.
+ * @param {string | string[] | undefined} value
+ * @returns {number | undefined}
+ */
+export function parseExpiresWithinDays(value) {
+    // exit on empty parameter
+    if (value === undefined || value === null || value === "") {
+        return undefined;
+    }
+    const raw = Array.isArray(value) ? value[0] : value;
+    const days = Number(raw);
+    if (!Number.isInteger(days) || days < 1) {
+        throw new Error("expiresWithin must be a positive integer number of days");
+    }
+    return days;
+}
