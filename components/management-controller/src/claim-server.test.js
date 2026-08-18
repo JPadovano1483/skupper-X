@@ -49,7 +49,11 @@ vi.mock("./notify.js", () => ({
 }));
 
 import { LoadSecret } from "@vms/modules/kube";
-import { CompleteMember, _registerMemberCompletionForTest } from "./claim-server.js";
+import {
+    CompleteMember,
+    _registerMemberCompletionForTest,
+    _processClaimForTest,
+} from "./claim-server.js";
 
 describe("CompleteMember", () => {
     it("handles unknown member id without throwing", async () => {
@@ -94,5 +98,27 @@ describe("CompleteMember", () => {
         expect(callback).toHaveBeenCalled();
         expect(LoadSecret).toHaveBeenCalledWith("tls-secret");
         expect(mockClient.release).toHaveBeenCalled();
+    });
+});
+
+describe("_processClaimForTest", () => {
+    it("rejects claims against invitations with lifecycle expired", async () => {
+        let invitationSql;
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("FROM MemberInvitations")) {
+                invitationSql = sql;
+                return { rowCount: 0, rows: [] };
+            }
+            return { rows: [] };
+        });
+
+        const [statusCode, statusDescription] = await _processClaimForTest("inv-expired", "site-a");
+
+        expect(invitationSql).toContain("LifeCycle != 'expired'");
+        expect(statusCode).toBe(400);
+        expect(statusDescription).toContain("No valid invitation exists for the claim");
     });
 });

@@ -178,6 +178,43 @@ describe("mc-apiserver routes", () => {
         expect(res.text).toContain("Malformed signedby reference");
     });
 
+    it("GET /certs adds expiresWithin filter to the query", async () => {
+        let certsSql;
+        let certsParams;
+        mockClient.query.mockImplementation(async (sql, params) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("FROM tlsCertificates WHERE signedBy IS NULL")) {
+                certsSql = sql;
+                certsParams = params;
+                return { rows: [], rowCount: 0 };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        await request(app)
+            .get("/api/v1alpha1/certs")
+            .query({ expiresWithin: "30" })
+            .set("x-test-auth", "1")
+            .expect(200);
+
+        expect(certsSql).toContain("expiration <= NOW()");
+        expect(certsParams).toEqual([30]);
+    });
+
     it("GET /vans/:vid/config/nonconnecting returns network yaml", async () => {
         const { app } = await buildApiApp({
             includeAdmin: false,
