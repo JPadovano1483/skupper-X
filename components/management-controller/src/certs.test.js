@@ -45,6 +45,7 @@ vi.mock("./config.js", () => ({
     BackboneExpiration: vi.fn(() => ({ years: 1 })),
     DefaultCaExpiration: vi.fn(() => ({ days: 30 })),
     DefaultCertExpiration: vi.fn(() => ({ days: 7 })),
+    CertRenewBefore: vi.fn(() => ({ days: 30 })),
     SiteControllerImage: vi.fn(() => "quay.io/skupper/vms-site-controller:latest"),
     RootIssuer: vi.fn(() => "vms-root"),
     CertOrganization: vi.fn(() => "enterprise.com"),
@@ -70,7 +71,18 @@ vi.mock("./watch-server.js", () => ({
 
 vi.mock("./db.js", () => ({
     ClientFromPool: vi.fn(async () => mockClient),
-    IntervalMilliseconds: vi.fn(() => 3600000),
+    IntervalMilliseconds: vi.fn((value) => {
+        if (value?.years) {
+            return value.years * 365 * 24 * 3600000;
+        }
+        if (value?.days) {
+            return value.days * 24 * 3600000;
+        }
+        if (value?.hours) {
+            return value.hours * 3600000;
+        }
+        return 3600000;
+    }),
 }));
 
 vi.mock("./notify.js", () => ({
@@ -352,6 +364,10 @@ describe("onCertificateRequestsChange", () => {
                 metadata: expect.objectContaining({
                     name: "vms-mgmt-controller-cert-req-3",
                 }),
+                spec: expect.objectContaining({
+                    duration: "8760h",
+                    renewBefore: "720h",
+                }),
             })
         );
         expect(notifyEvents).toContainEqual({
@@ -359,6 +375,41 @@ describe("onCertificateRequestsChange", () => {
             table: "CertificateRequests",
             id: "cert-req-3",
         });
+    });
+
+    it("clamps renewBefore to one-third of duration when the configured window does not fit", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("FROM CertificateRequests WHERE RequestTime")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: "cert-req-short",
+                            requesttype: "mgmtController",
+                            durationhours: 24,
+                        },
+                    ],
+                };
+            }
+            if (sql.includes("UPDATE CertificateRequests SET Lifecycle = 'cm_cert_created'")) {
+                return {};
+            }
+            return {};
+        });
+
+        await notificationHandlers.CertificateRequests("ADD", "cert-req-short");
+
+        expect(ApplyObject).toHaveBeenCalledWith(
+            expect.objectContaining({
+                spec: expect.objectContaining({
+                    duration: "24h",
+                    renewBefore: "8h",
+                }),
+            })
+        );
     });
 
     it("ignores non-ADD actions", async () => {

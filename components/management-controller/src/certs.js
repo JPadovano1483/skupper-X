@@ -32,6 +32,7 @@ import {
     BackboneExpiration,
     DefaultCaExpiration,
     DefaultCertExpiration,
+    CertRenewBefore,
     SiteControllerImage,
     RootIssuer,
     CertOrganization,
@@ -845,6 +846,20 @@ const onCertificateWatch = async function (action, cert) {
 };
 
 //
+// cert-manager requires renewBefore < duration. Prefer the configured
+// CertRenewBefore window; if it does not fit this certificate, fall back to
+// one-third of duration (cert-manager's implicit 2/3-of-lifetime default).
+//
+function certManagerRenewBefore(duration_hours) {
+    const configuredHours = Math.floor(IntervalMilliseconds(CertRenewBefore()) / 3600000);
+    if (configuredHours >= 1 && configuredHours < duration_hours) {
+        return `${configuredHours}h`;
+    }
+    const fallbackHours = Math.max(1, Math.min(Math.floor(duration_hours / 3), duration_hours - 1));
+    return `${fallbackHours}h`;
+}
+
+//
 // Generate a cert-manager Certificate object from a template.
 //
 const certificateObject = function (
@@ -878,6 +893,7 @@ const certificateObject = function (
                 },
             },
             duration: `${duration_hours}h`,
+            renewBefore: certManagerRenewBefore(duration_hours),
             subject: {
                 organizations: [CertOrganization()],
             },

@@ -33,6 +33,9 @@ export function DefaultCaExpiration() {
 export function DefaultCertExpiration() {
     return config.defaultcertexpiration;
 }
+export function CertRenewBefore() {
+    return config.certrenewbefore;
+}
 export function CertOrganization() {
     return config.certorganization;
 }
