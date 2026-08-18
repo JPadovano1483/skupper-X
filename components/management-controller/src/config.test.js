@@ -23,6 +23,7 @@ const mockConfig = {
     rootissuer: "test-root-issuer",
     defaultcaexpiration: { days: 365 },
     defaultcertexpiration: { days: 90 },
+    certrenewbefore: { days: 30 },
     certorganization: "Skupper Test Org",
     backbonecaexpiration: { years: 1 },
     sitecontrollerimage: "quay.io/skupper/vms-site-controller:test",
@@ -37,6 +38,7 @@ import {
     RootIssuer,
     DefaultCaExpiration,
     DefaultCertExpiration,
+    CertRenewBefore,
     CertOrganization,
     BackboneExpiration,
     SiteControllerImage,
@@ -57,6 +59,10 @@ describe("config getters", () => {
 
     it("DefaultCertExpiration returns configured value", () => {
         expect(DefaultCertExpiration()).toEqual({ days: 90 });
+    });
+
+    it("CertRenewBefore returns configured value", () => {
+        expect(CertRenewBefore()).toEqual({ days: 30 });
     });
 
     it("CertOrganization returns configured value", () => {
