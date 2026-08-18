@@ -55,6 +55,7 @@ import {
     SiteDeleted,
     SiteCertificateChanged,
     SiteIngressChanged,
+    MemberEvicted,
     _registerPeerForTest,
 } from "./sync-management.js";
 import { DeletePeer, UpdateLocalState } from "@vms/modules/state-sync";
@@ -302,5 +303,19 @@ describe("SiteIngressChanged", () => {
             expect.stringMatching(/^[a-f0-9]{40}$/)
         );
         expect(mockClient.release).toHaveBeenCalled();
+    });
+});
+
+describe("MemberEvicted", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it("clears tls-site state for the evicted member", async () => {
+        _registerPeerForTest("member-1", "member");
+
+        await MemberEvicted("member-1");
+
+        expect(UpdateLocalState).toHaveBeenCalledWith("member-1", "tls-site-member-1", null);
     });
 });

@@ -884,6 +884,10 @@ export async function SiteDeleted(siteId) {
     DeletePeer(siteId);
 }
 
+export async function MemberEvicted(memberId) {
+    await UpdateLocalState(memberId, `tls-site-${memberId}`, null);
+}
+
 export async function Start() {
     await StateSyncStart(
         CLASS_MANAGEMENT,

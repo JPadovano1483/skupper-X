@@ -28,6 +28,15 @@ vi.mock("./watch-server.js", () => ({
     WatchNotify: vi.fn(),
 }));
 
+vi.mock("@vms/modules/kube", () => ({
+    DeleteCertificate: vi.fn(),
+    DeleteSecret: vi.fn(),
+}));
+
+vi.mock("./sync-management.js", () => ({
+    MemberEvicted: vi.fn(async () => {}),
+}));
+
 vi.mock("./db.js", async (importOriginal) => {
     const actual = await importOriginal();
     return {
@@ -35,6 +44,9 @@ vi.mock("./db.js", async (importOriginal) => {
         ClientFromPool: vi.fn(async () => mockClient),
     };
 });
+
+import { DeleteCertificate, DeleteSecret } from "@vms/modules/kube";
+import { MemberEvicted } from "./sync-management.js";
 
 describe("api-user", () => {
     beforeEach(() => {
@@ -180,5 +192,90 @@ describe("api-user", () => {
         const res = await request(app).get("/api/v1alpha1/vans").set("x-test-auth", "1");
 
         expect(res.status).toBe(403);
+    });
+
+    it("PUT /members/:mid/evict revokes cert and marks member expired", async () => {
+        const queries = [];
+        mockClient.query.mockImplementation(async (sql, params) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            queries.push({ sql, params });
+            if (sql.includes("FROM MemberSites LEFT JOIN TlsCertificates")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            certificate: TEST_UUIDS.cert,
+                            objectname: "vms-member-test",
+                            expiration: new Date("2026-12-31T00:00:00.000Z"),
+                        },
+                    ],
+                };
+            }
+            if (sql.includes("INSERT INTO TlsClientRevocations")) {
+                return { rowCount: 1 };
+            }
+            if (sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")) {
+                return { rowCount: 1 };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/members/${TEST_UUIDS.member}/evict`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(200);
+        expect(
+            queries.some(
+                (query) =>
+                    query.sql.includes("INSERT INTO TlsClientRevocations") &&
+                    query.params[0] === TEST_UUIDS.cert
+            )
+        ).toBe(true);
+        expect(
+            queries.some((query) =>
+                query.sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")
+            )
+        ).toBe(true);
+        expect(DeleteSecret).toHaveBeenCalledWith("vms-member-test");
+        expect(DeleteCertificate).toHaveBeenCalledWith("vms-member-test");
+        expect(MemberEvicted).toHaveBeenCalledWith(TEST_UUIDS.member);
+    });
+
+    it("PUT /members/:mid/evict returns 404 when member is missing", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("FROM MemberSites LEFT JOIN TlsCertificates")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/members/${TEST_UUIDS.member}/evict`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(404);
+        expect(MemberEvicted).not.toHaveBeenCalled();
     });
 });

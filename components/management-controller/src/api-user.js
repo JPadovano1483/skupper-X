@@ -21,9 +21,11 @@
 
 import { IncomingForm } from "formidable";
 import { ClientFromPool, queryWithContext } from "./db.js";
+import { DeleteCertificate, DeleteSecret } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
 import { IsValidUuid, ValidateAndNormalizeFields, UniquifyName } from "@vms/modules/util";
 import { NotifyTransaction } from "./notify.js";
+import { MemberEvicted } from "./sync-management.js";
 
 const API_PREFIX = "/api/v1alpha1/";
 
@@ -564,9 +566,61 @@ const readCertificate = async function (req, res) {
 };
 
 const evictMember = async function (req, res) {
-    const _mid = req.params.mid;
-    const returnStatus = 501;
-    res.status(returnStatus).send("Member eviction not implemented");
+    const mid = req.params.mid;
+    let returnStatus = 200;
+    if (!IsValidUuid(mid)) {
+        res.status(400).send("Member-Id is not a valid uuid");
+        return 400;
+    }
+
+    const client = await ClientFromPool();
+    const notify = new NotifyTransaction();
+    let objectName;
+    try {
+        await queryWithContext(req, client, async (client) => {
+            const result = await client.query(
+                "SELECT MemberSites.Certificate, TlsCertificates.ObjectName, TlsCertificates.Expiration " +
+                    "FROM MemberSites LEFT JOIN TlsCertificates ON TlsCertificates.Id = MemberSites.Certificate " +
+                    "WHERE MemberSites.Id = $1",
+                [mid]
+            );
+            if (result.rowCount != 1) {
+                returnStatus = 404;
+                throw new Error("Member site not found");
+            }
+            const row = result.rows[0];
+            if (row.certificate) {
+                await client.query(
+                    "INSERT INTO TlsClientRevocations (CertificateId, Expiration, Reason) VALUES ($1, $2, $3) ON CONFLICT (CertificateId) DO NOTHING",
+                    [row.certificate, row.expiration, "Evicted via API"]
+                );
+                objectName = row.objectname;
+            }
+            await client.query(
+                "UPDATE MemberSites SET Lifecycle = 'expired', Failure = 'Evicted via API' WHERE Id = $1",
+                [mid]
+            );
+            notify.update("MemberSites", mid);
+        });
+        await notify.commit();
+        if (objectName) {
+            try {
+                await DeleteSecret(objectName);
+                await DeleteCertificate(objectName);
+            } catch (error) {
+                Log(`WARN: Failed to delete member cert for ${mid}: ${error.message}`);
+            }
+        }
+        await MemberEvicted(mid);
+        res.status(returnStatus).end();
+    } catch (error) {
+        if (returnStatus === 200) {
+            returnStatus = 500;
+        }
+        res.status(returnStatus).send(error.message);
+    } finally {
+        client.release();
+    }
     return returnStatus;
 };
 
