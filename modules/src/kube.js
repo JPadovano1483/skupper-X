@@ -149,6 +149,46 @@ export async function LoadCertificate(name) {
     });
 }
 
+//
+// cert-manager has no metadata annotation that forces renewal. cmctl renew
+// sets status.conditions[type=Issuing] to True with reason ManuallyTriggered.
+//
+export function markCertificateForRenewal(cert, now = new Date()) {
+    const issuing = {
+        type: "Issuing",
+        status: "True",
+        reason: "ManuallyTriggered",
+        message: "Certificate re-issuance manually triggered",
+        lastTransitionTime: now.toISOString(),
+    };
+    if (cert.metadata?.generation !== undefined) {
+        issuing.observedGeneration = cert.metadata.generation;
+    }
+    const existing = Array.isArray(cert.status?.conditions) ? cert.status.conditions : [];
+    const conditions = existing.filter((condition) => condition.type !== "Issuing");
+    conditions.push(issuing);
+    return {
+        ...cert,
+        status: {
+            ...cert.status,
+            conditions,
+        },
+    };
+}
+
+export async function TriggerCertificateRenewal(name) {
+    const cert = await LoadCertificate(name);
+    const body = markCertificateForRenewal(cert);
+    return await customApi.replaceNamespacedCustomObjectStatus({
+        group: "cert-manager.io",
+        version: "v1",
+        namespace: namespace,
+        plural: "certificates",
+        name: name,
+        body,
+    });
+}
+
 export async function DeleteCertificate(name) {
     await customApi.deleteNamespacedCustomObject({
         group: "cert-manager.io",

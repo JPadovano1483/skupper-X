@@ -22,11 +22,13 @@
 import {
     ApplyObject,
     LoadCertificate,
+    TriggerCertificateRenewal,
     WatchSecrets,
     WatchCertificates,
     GetIssuers,
 } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
+import { IsValidUuid } from "@vms/modules/util";
 import { ClientFromPool, IntervalMilliseconds } from "./db.js";
 import {
     BackboneExpiration,
@@ -974,6 +976,57 @@ const WatchCertManager = async function () {
         }
     }
 };
+
+function httpError(statusCode, message) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
+function kubeStatusCode(err) {
+    return err?.statusCode || err?.code || err?.response?.statusCode;
+}
+
+//
+// Force in-place cert-manager renewal for an existing TlsCertificates row.
+// Does not insert CertificateRequests — that would create a differently
+// named Certificate CR and break the current FK/secret model.
+//
+export async function RotateCertificate(cid) {
+    if (!IsValidUuid(cid)) {
+        throw httpError(400, `Malformed certificate ID: ${cid}`);
+    }
+
+    const client = await ClientFromPool("system");
+    try {
+        const result = await client.query(
+            "SELECT id, objectname, label, isca, expiration, renewaltime, generation FROM tlsCertificates WHERE id = $1",
+            [cid]
+        );
+        if (result.rowCount == 0) {
+            throw httpError(404, "Certificate not found");
+        }
+        const cert = result.rows[0];
+        if (cert.isca) {
+            throw httpError(409, "CA certificate rotation is not supported");
+        }
+        if (!cert.objectname) {
+            throw httpError(400, "Certificate has no Kubernetes object");
+        }
+        Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
+        try {
+            await TriggerCertificateRenewal(cert.objectname);
+        } catch (err) {
+            if (kubeStatusCode(err) == 404) {
+                throw httpError(404, `Certificate object ${cert.objectname} not found`);
+            }
+            throw err;
+        }
+        return cert;
+    } finally {
+        client.release();
+    }
+}
 
 export async function Start() {
     Log("[Certificate module starting]");

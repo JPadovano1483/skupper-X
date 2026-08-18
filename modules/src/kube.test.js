@@ -18,7 +18,7 @@
 */
 
 import { describe, it, expect } from "vitest";
-import { Annotation, Controlled, Namespace } from "./kube.js";
+import { Annotation, Controlled, Namespace, markCertificateForRenewal } from "./kube.js";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_STATE_ID } from "./common.js";
 
 describe("kube helpers", () => {
@@ -60,5 +60,49 @@ describe("kube helpers", () => {
 
     it("Namespace defaults to default before Start", () => {
         expect(Namespace()).toBe("default");
+    });
+
+    it("markCertificateForRenewal sets Issuing=True like cmctl renew", () => {
+        const now = new Date("2026-08-18T15:00:00.000Z");
+        const marked = markCertificateForRenewal(
+            {
+                metadata: { name: "vms-interior-cert-1", generation: 7 },
+                status: {
+                    notAfter: "2026-10-12T12:00:00.000Z",
+                    conditions: [
+                        { type: "Ready", status: "True" },
+                        { type: "Issuing", status: "False", reason: "Issued" },
+                    ],
+                },
+            },
+            now
+        );
+
+        expect(marked.status.notAfter).toBe("2026-10-12T12:00:00.000Z");
+        expect(marked.status.conditions).toEqual([
+            { type: "Ready", status: "True" },
+            {
+                type: "Issuing",
+                status: "True",
+                reason: "ManuallyTriggered",
+                message: "Certificate re-issuance manually triggered",
+                lastTransitionTime: "2026-08-18T15:00:00.000Z",
+                observedGeneration: 7,
+            },
+        ]);
+    });
+
+    it("markCertificateForRenewal creates status conditions when missing", () => {
+        const marked = markCertificateForRenewal({
+            metadata: { name: "leaf" },
+        });
+
+        expect(marked.status.conditions).toHaveLength(1);
+        expect(marked.status.conditions[0]).toMatchObject({
+            type: "Issuing",
+            status: "True",
+            reason: "ManuallyTriggered",
+        });
+        expect(marked.status.conditions[0].observedGeneration).toBeUndefined();
     });
 });
