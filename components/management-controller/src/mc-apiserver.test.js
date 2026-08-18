@@ -21,6 +21,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import { createMockClient, TEST_UUIDS } from "./test-helpers/mock-db.js";
 import { buildApiApp } from "./test-helpers/build-api-app.js";
+import { RotateCertificate } from "./certs.js";
 
 const mockClient = createMockClient();
 let mockFormFields = {};
@@ -41,6 +42,10 @@ vi.mock("formidable", () => {
 
 vi.mock("./watch-server.js", () => ({
     WatchNotify: vi.fn(),
+}));
+
+vi.mock("./certs.js", () => ({
+    RotateCertificate: vi.fn(),
 }));
 
 vi.mock("./sync-management.js", async (importOriginal) => {
@@ -266,5 +271,64 @@ describe("mc-apiserver routes", () => {
             .expect(201);
 
         expect(res.body).toEqual({ processed: 1 });
+    });
+
+    it("POST /certs/:cid/rotate returns 202 and cert metadata", async () => {
+        const cert = {
+            id: TEST_UUIDS.cert,
+            objectname: "vms-interior-cert-1",
+            label: "site-a",
+            isca: false,
+        };
+        RotateCertificate.mockResolvedValue(cert);
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        const res = await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/rotate`)
+            .set("x-test-auth", "1")
+            .expect(202);
+
+        expect(RotateCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert);
+        expect(res.body).toEqual(cert);
+    });
+
+    it("POST /certs/:cid/rotate maps statusCode from RotateCertificate", async () => {
+        const error = new Error("Certificate not found");
+        error.statusCode = 404;
+        RotateCertificate.mockRejectedValue(error);
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        const res = await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/rotate`)
+            .set("x-test-auth", "1")
+            .expect(404);
+
+        expect(res.text).toBe("Certificate not found");
+    });
+
+    it("POST /certs/:cid/rotate requires certificate-manager", async () => {
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+            roles: ["admin"],
+        });
+
+        await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/rotate`)
+            .set("x-test-auth", "1")
+            .expect(403);
+
+        expect(RotateCertificate).not.toHaveBeenCalled();
     });
 });

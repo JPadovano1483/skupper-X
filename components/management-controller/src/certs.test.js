@@ -34,6 +34,7 @@ const notifyEvents = [];
 vi.mock("@vms/modules/kube", () => ({
     ApplyObject: vi.fn(),
     LoadCertificate: vi.fn(),
+    TriggerCertificateRenewal: vi.fn(),
     WatchSecrets: vi.fn((handler) => {
         secretWatchHandler = handler;
     }),
@@ -103,9 +104,9 @@ vi.mock("./notify.js", () => ({
     },
 }));
 
-import { Start } from "./certs.js";
+import { Start, RotateCertificate } from "./certs.js";
 import { RegisterNotification } from "./notify.js";
-import { ApplyObject, LoadCertificate } from "@vms/modules/kube";
+import { ApplyObject, LoadCertificate, TriggerCertificateRenewal } from "@vms/modules/kube";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
 
 function transactionSql(sql) {
@@ -663,6 +664,95 @@ describe("onSecretWatch", () => {
         await vi.waitFor(() => {
             expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-1");
             expect(AccessCertificateChanged).toHaveBeenCalledWith("cert-1");
+        });
+    });
+});
+
+describe("RotateCertificate", () => {
+    const certId = "00000000-0000-4000-8000-000000000007";
+    const certRow = {
+        id: certId,
+        objectname: "vms-interior-cert-1",
+        label: "site-a",
+        isca: false,
+        expiration: "2026-10-12T12:00:00.000Z",
+        renewaltime: "2026-10-11T12:00:00.000Z",
+        generation: 1,
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+    });
+
+    it("triggers cert-manager renewal for a leaf certificate", async () => {
+        mockClient.query.mockResolvedValue({ rowCount: 1, rows: [certRow] });
+        TriggerCertificateRenewal.mockResolvedValue({});
+
+        await expect(RotateCertificate(certId)).resolves.toEqual(certRow);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("FROM tlsCertificates WHERE id = $1"),
+            [certId]
+        );
+        expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
+        expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it("rejects a malformed certificate id", async () => {
+        await expect(RotateCertificate("not-a-uuid")).rejects.toMatchObject({
+            statusCode: 400,
+            message: "Malformed certificate ID: not-a-uuid",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+        expect(mockClient.query).not.toHaveBeenCalled();
+    });
+
+    it("returns 404 when the certificate row is missing", async () => {
+        mockClient.query.mockResolvedValue({ rowCount: 0, rows: [] });
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 404,
+            message: "Certificate not found",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+        expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it("refuses CA rotation", async () => {
+        mockClient.query.mockResolvedValue({
+            rowCount: 1,
+            rows: [{ ...certRow, isca: true }],
+        });
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 409,
+            message: "CA certificate rotation is not supported",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
+    it("rejects a certificate with no Kubernetes object name", async () => {
+        mockClient.query.mockResolvedValue({
+            rowCount: 1,
+            rows: [{ ...certRow, objectname: null }],
+        });
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 400,
+            message: "Certificate has no Kubernetes object",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
+    it("maps a missing Certificate CR to 404", async () => {
+        mockClient.query.mockResolvedValue({ rowCount: 1, rows: [certRow] });
+        const missing = new Error("not found");
+        missing.statusCode = 404;
+        TriggerCertificateRenewal.mockRejectedValue(missing);
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 404,
+            message: "Certificate object vms-interior-cert-1 not found",
         });
     });
 });
