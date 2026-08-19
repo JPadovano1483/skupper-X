@@ -23,6 +23,7 @@ import { createMockClient, TEST_UUIDS } from "./test-helpers/mock-db.js";
 import { buildApiApp } from "./test-helpers/build-api-app.js";
 import { RotateCertificate } from "./certs.js";
 import { RevokeCertificate } from "./tls-revoke.js";
+import { PruneNow } from "./prune.js";
 
 const mockClient = createMockClient();
 let mockFormFields = {};
@@ -51,6 +52,10 @@ vi.mock("./certs.js", () => ({
 
 vi.mock("./tls-revoke.js", () => ({
     RevokeCertificate: vi.fn(),
+}));
+
+vi.mock("./prune.js", () => ({
+    PruneNow: vi.fn(async () => {}),
 }));
 
 vi.mock("./sync-management.js", async (importOriginal) => {
@@ -358,6 +363,7 @@ describe("mc-apiserver routes", () => {
             .expect(200);
 
         expect(RevokeCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert);
+        expect(PruneNow).toHaveBeenCalled();
         expect(res.body).toEqual(cert);
     });
 
@@ -378,6 +384,7 @@ describe("mc-apiserver routes", () => {
             .expect(409);
 
         expect(res.text).toBe("CA certificate revocation is not supported");
+        expect(PruneNow).not.toHaveBeenCalled();
     });
 
     it("POST /certs/:cid/revoke requires certificate-manager", async () => {

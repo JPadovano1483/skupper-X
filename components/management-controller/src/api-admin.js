@@ -30,6 +30,7 @@ import {
 } from "./site-deployment-state.js";
 import { ValidateAndNormalizeFields, IsValidUuid, UniquifyName } from "@vms/modules/util";
 import { NotifyTransaction } from "./notify.js";
+import { PruneNow, deleteUnreferencedKubeTls } from "./prune.js";
 
 const API_PREFIX = "/api/v1alpha1/";
 const INGRESS_LIST = ["claim", "peer", "member", "manage"];
@@ -543,9 +544,13 @@ const deleteBackboneSite = async function (req, res) {
         }
 
         let accessPointIds = [];
+        const kubeObjectNames = [];
+        let deleted = false;
         await queryWithContext(req, client, async (client) => {
             const result = await client.query(
-                "SELECT Certificate, CoLocated FROM InteriorSites WHERE Id = $1",
+                "SELECT InteriorSites.Certificate, InteriorSites.CoLocated, TlsCertificates.ObjectName " +
+                    "FROM InteriorSites LEFT JOIN TlsCertificates ON TlsCertificates.Id = InteriorSites.Certificate " +
+                    "WHERE InteriorSites.Id = $1",
                 [sid]
             );
             if (result.rowCount == 1) {
@@ -558,28 +563,40 @@ const deleteBackboneSite = async function (req, res) {
                     throw new Error("Cannot delete a co-located backbone site");
                 }
 
+                deleted = true;
+                if (row.objectname) {
+                    kubeObjectNames.push(row.objectname);
+                }
+
                 //
                 // Delete all of the site's access points
                 //
                 const apResult = await client.query(
-                    "SELECT Id, Certificate FROM BackboneAccessPoints WHERE InteriorSite = $1",
+                    "SELECT BackboneAccessPoints.Id, BackboneAccessPoints.Certificate, TlsCertificates.ObjectName " +
+                        "FROM BackboneAccessPoints LEFT JOIN TlsCertificates ON TlsCertificates.Id = BackboneAccessPoints.Certificate " +
+                        "WHERE BackboneAccessPoints.InteriorSite = $1",
                     [sid]
                 );
                 accessPointIds = apResult.rows.map((ap) => ap.id);
-                for (const row of apResult.rows) {
-                    if (row.certificate) {
+                for (const apRow of apResult.rows) {
+                    if (apRow.objectname) {
+                        kubeObjectNames.push(apRow.objectname);
+                    }
+                    if (apRow.certificate) {
                         await client.query(
                             "UPDATE BackboneAccessPoints SET Certificate = NULL WHERE Id = $1",
-                            [row.id]
+                            [apRow.id]
                         );
                         await client.query("DELETE FROM TlsCertificates WHERE Id = $1", [
-                            row.certificate,
+                            apRow.certificate,
                         ]);
                         // No notify for BackboneAccessPoints needed
-                        notify.delete("TlsCertificates", row.certificate);
+                        notify.delete("TlsCertificates", apRow.certificate);
                     }
-                    await client.query("DELETE FROM BackboneAccessPoints WHERE Id = $1", [row.id]);
-                    notify.delete("BackboneAccessPoints", row.id);
+                    await client.query("DELETE FROM BackboneAccessPoints WHERE Id = $1", [
+                        apRow.id,
+                    ]);
+                    notify.delete("BackboneAccessPoints", apRow.id);
                 }
 
                 //
@@ -606,6 +623,11 @@ const deleteBackboneSite = async function (req, res) {
         //
         await SiteDeleted(sid, accessPointIds);
 
+        if (deleted) {
+            await deleteUnreferencedKubeTls(kubeObjectNames);
+            await PruneNow();
+        }
+
         res.status(returnStatus).end();
         await notify.commit();
     } catch (error) {
@@ -623,6 +645,7 @@ const deleteAccessPoint = async function (req, res) {
     const apid = req.params.apid;
     let siteId;
     let wasManage = false;
+    let deleted = false;
     const client = await ClientFromPool();
     const notify = new NotifyTransaction();
     try {
@@ -650,6 +673,7 @@ const deleteAccessPoint = async function (req, res) {
             );
             notify.delete("BackboneAccessPoints", apid);
             if (apResult.rowCount == 1) {
+                deleted = true;
                 const row = apResult.rows[0];
                 if (row.certificate) {
                     await client.query("DELETE FROM TlsCertificates WHERE Id = $1", [
@@ -663,6 +687,10 @@ const deleteAccessPoint = async function (req, res) {
                 }
             }
         });
+
+        if (deleted) {
+            await PruneNow();
+        }
 
         res.status(returnStatus).end();
         await notify.commit();

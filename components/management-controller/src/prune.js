@@ -31,55 +31,92 @@ import { Log } from "@vms/modules/log";
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
 import { ClientFromPool } from "./db.js";
 import { NotifyTransaction } from "./notify.js";
-import { deleteExpiredRevocations, listRevokedCertificateIds } from "./tls-revoke.js";
+import {
+    deleteExpiredRevocations,
+    deleteKubeTlsObjectList,
+    listRevokedCertificateIds,
+} from "./tls-revoke.js";
 
-const reconcileCertificates = async function () {
+function uniqueObjectNames(objectNames) {
+    const names = [];
+    const seen = new Set();
+    for (const name of objectNames || []) {
+        if (!name || seen.has(name)) {
+            continue;
+        }
+        seen.add(name);
+        names.push(name);
+    }
+    return names;
+}
+
+function isVmsControlledOrphan(obj, dbCertNames) {
+    return (
+        obj?.metadata?.annotations?.[META_ANNOTATION_VMS_CONTROLLED] == "true" &&
+        !dbCertNames.has(obj.metadata.name)
+    );
+}
+
+async function deleteKubeOrphan(kind, name, deleteHandler) {
+    try {
+        await deleteHandler(name);
+        Log(`  Deleted ${kind}: ${name}`);
+    } catch (error) {
+        Log(`WARN: Failed to delete ${kind} ${name}: ${error.message}`);
+    }
+}
+
+export async function reconcileCertificates() {
     const client = await ClientFromPool("system");
     try {
         const result = await client.query("SELECT ObjectName FROM TlsCertificates");
-        const db_cert_names = [];
-        result.rows.forEach((row) => {
-            db_cert_names.push(row.objectname);
-        });
+        const dbCertNames = new Set(
+            result.rows.map((row) => row.objectname).filter(Boolean)
+        );
 
-        const issuer_list = await GetIssuers();
-        issuer_list.forEach((issuer) => {
-            if (
-                !db_cert_names.includes(issuer.metadata.name) &&
-                issuer.metadata.annotations?.[META_ANNOTATION_VMS_CONTROLLED] == "true"
-            ) {
-                DeleteIssuer(issuer.metadata.name);
-                Log(`  Deleted issuer: ${issuer.metadata.name}`);
+        for (const issuer of (await GetIssuers()) || []) {
+            if (isVmsControlledOrphan(issuer, dbCertNames)) {
+                await deleteKubeOrphan("issuer", issuer.metadata.name, DeleteIssuer);
             }
-        });
+        }
 
-        const cert_list = await GetCertificates();
-        cert_list.forEach((cert) => {
-            if (
-                !db_cert_names.includes(cert.metadata.name) &&
-                cert.metadata.annotations?.[META_ANNOTATION_VMS_CONTROLLED] == "true"
-            ) {
-                DeleteCertificate(cert.metadata.name);
-                Log(`  Deleted certificate: ${cert.metadata.name}`);
+        for (const cert of (await GetCertificates()) || []) {
+            if (isVmsControlledOrphan(cert, dbCertNames)) {
+                await deleteKubeOrphan("certificate", cert.metadata.name, DeleteCertificate);
             }
-        });
+        }
 
-        const secret_list = await GetSecrets();
-        secret_list.forEach((secret) => {
-            if (
-                !db_cert_names.includes(secret.metadata.name) &&
-                secret.metadata.annotations?.[META_ANNOTATION_VMS_CONTROLLED] == "true"
-            ) {
-                DeleteSecret(secret.metadata.name);
-                Log(`  Deleted secret: ${secret.metadata.name}`);
+        for (const secret of (await GetSecrets()) || []) {
+            if (isVmsControlledOrphan(secret, dbCertNames)) {
+                await deleteKubeOrphan("secret", secret.metadata.name, DeleteSecret);
             }
-        });
+        }
     } catch (error) {
         Log(`Exception in reconcileCertificates: ${error.stack}`);
     } finally {
         client.release();
     }
-};
+}
+
+export async function deleteUnreferencedKubeTls(objectNames) {
+    const names = uniqueObjectNames(objectNames);
+    if (names.length == 0) {
+        return;
+    }
+    const client = await ClientFromPool("system");
+    try {
+        const result = await client.query(
+            "SELECT DISTINCT ObjectName FROM TlsCertificates WHERE ObjectName = ANY($1)",
+            [names]
+        );
+        const referenced = new Set(result.rows.map((row) => row.objectname));
+        await deleteKubeTlsObjectList(names.filter((name) => !referenced.has(name)));
+    } catch (error) {
+        Log(`Exception in deleteUnreferencedKubeTls: ${error.stack}`);
+    } finally {
+        client.release();
+    }
+}
 
 export async function DeleteOrphanCertificates() {
     const client = await ClientFromPool("system");
@@ -166,8 +203,16 @@ export async function DeleteOrphanCertificates() {
     }
 }
 
+export async function PruneNow() {
+    try {
+        Log("[Prune - Reconciling Kubernetes objects to the database]");
+        await DeleteOrphanCertificates();
+        await reconcileCertificates();
+    } catch (error) {
+        Log(`Exception in PruneNow: ${error.stack}`);
+    }
+}
+
 export async function Start() {
-    Log("[Prune - Reconciling Kubernetes objects to the database]");
-    await DeleteOrphanCertificates();
-    await reconcileCertificates();
+    await PruneNow();
 }

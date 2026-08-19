@@ -36,6 +36,10 @@ vi.mock("./tls-revoke.js", () => ({
     RevokeCertificate: vi.fn(async () => ({})),
 }));
 
+vi.mock("./prune.js", () => ({
+    PruneNow: vi.fn(async () => {}),
+}));
+
 vi.mock("./db.js", async (importOriginal) => {
     const actual = await importOriginal();
     return {
@@ -46,6 +50,7 @@ vi.mock("./db.js", async (importOriginal) => {
 
 import { MemberEvicted } from "./sync-management.js";
 import { RevokeCertificate } from "./tls-revoke.js";
+import { PruneNow } from "./prune.js";
 
 describe("api-user", () => {
     beforeEach(() => {
@@ -237,6 +242,7 @@ describe("api-user", () => {
         expect(RevokeCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert, {
             reason: "Evicted via API",
         });
+        expect(PruneNow).toHaveBeenCalled();
         expect(MemberEvicted).toHaveBeenCalledWith(TEST_UUIDS.member);
     });
 
@@ -265,6 +271,7 @@ describe("api-user", () => {
 
         expect(res.status).toBe(404);
         expect(RevokeCertificate).not.toHaveBeenCalled();
+        expect(PruneNow).not.toHaveBeenCalled();
         expect(MemberEvicted).not.toHaveBeenCalled();
     });
 
@@ -305,6 +312,7 @@ describe("api-user", () => {
         expect(RevokeCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert, {
             reason: "Invitation expired via API",
         });
+        expect(PruneNow).toHaveBeenCalled();
     });
 
     it("PUT /invitations/:iid/expire returns 404 when invitation is missing", async () => {
@@ -332,6 +340,7 @@ describe("api-user", () => {
 
         expect(res.status).toBe(404);
         expect(RevokeCertificate).not.toHaveBeenCalled();
+        expect(PruneNow).not.toHaveBeenCalled();
     });
 
     it("PUT /invitations/:iid/expire does not revoke when invitation has no cert", async () => {
@@ -362,5 +371,99 @@ describe("api-user", () => {
 
         expect(res.status).toBe(200);
         expect(RevokeCertificate).not.toHaveBeenCalled();
+        expect(PruneNow).not.toHaveBeenCalled();
+    });
+
+    it("DELETE /vans/:vid prunes after deleting the application network", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("SELECT Id FROM MemberSites WHERE MemberOf")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("DELETE FROM ApplicationNetworks WHERE Id")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ certificate: TEST_UUIDS.cert }],
+                };
+            }
+            return { rows: [], rowCount: 1 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .delete(`/api/v1alpha1/vans/${TEST_UUIDS.van}`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(204);
+        expect(PruneNow).toHaveBeenCalled();
+    });
+
+    it("DELETE /vans/:vid does not prune when members still exist", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("SELECT Id FROM MemberSites WHERE MemberOf")) {
+                return { rowCount: 1, rows: [{ id: TEST_UUIDS.member }] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .delete(`/api/v1alpha1/vans/${TEST_UUIDS.van}`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(400);
+        expect(PruneNow).not.toHaveBeenCalled();
+    });
+
+    it("DELETE /invitations/:iid prunes after deleting the invitation", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("SELECT id FROM MemberSites WHERE Invitation")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("DELETE FROM MemberInvitations WHERE Id")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ certificate: TEST_UUIDS.cert }],
+                };
+            }
+            return { rows: [], rowCount: 1 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        await request(app)
+            .delete(`/api/v1alpha1/invitations/${TEST_UUIDS.invitation}`)
+            .set("x-test-auth", "1")
+            .expect(204);
+
+        expect(PruneNow).toHaveBeenCalled();
     });
 });

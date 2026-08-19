@@ -26,6 +26,7 @@ import { IsValidUuid, ValidateAndNormalizeFields, UniquifyName } from "@vms/modu
 import { NotifyTransaction } from "./notify.js";
 import { MemberEvicted } from "./sync-management.js";
 import { RevokeCertificate } from "./tls-revoke.js";
+import { PruneNow } from "./prune.js";
 
 const API_PREFIX = "/api/v1alpha1/";
 
@@ -453,6 +454,7 @@ const deleteVan = async function (req, res) {
                 throw new Error("Cannot delete application network because is still has members");
             }
         });
+        await PruneNow();
         await notify.commit();
         res.status(result.status).send(result.message);
     } catch (error) {
@@ -474,7 +476,7 @@ const deleteInvitation = async function (req, res) {
     const client = await ClientFromPool();
     const notify = new NotifyTransaction();
     try {
-        await queryWithContext(req, client, async (client) => {
+        const result = await queryWithContext(req, client, async (client) => {
             const result = await client.query(
                 "SELECT id FROM MemberSites WHERE Invitation = $1 LIMIT 1",
                 [iid]
@@ -493,6 +495,7 @@ const deleteInvitation = async function (req, res) {
                         ]);
                         notify.delete("TlsCertificates", row.certificate);
                     }
+                    return { deleted: true };
                 }
             } else {
                 returnStatus = 400;
@@ -500,7 +503,11 @@ const deleteInvitation = async function (req, res) {
                     "Cannot delete invitation because members still exist that use the invitation"
                 );
             }
+            return { deleted: false };
         });
+        if (result?.deleted) {
+            await PruneNow();
+        }
         await notify.commit();
         res.status(returnStatus).end();
     } catch (error) {
@@ -542,6 +549,7 @@ const expireInvitation = async function (req, res) {
                     `WARN: Failed to revoke invitation cert ${certificate} for ${iid}: ${error.message}`
                 );
             }
+            await PruneNow();
         }
         res.status(returnStatus).end();
         await notify.commit();
@@ -613,6 +621,7 @@ const evictMember = async function (req, res) {
                     `WARN: Failed to revoke member cert ${certificate} for ${mid}: ${error.message}`
                 );
             }
+            await PruneNow();
         }
         await MemberEvicted(mid);
         res.status(returnStatus).end();

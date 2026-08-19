@@ -21,6 +21,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import { createMockClient, TEST_UUIDS } from "./test-helpers/mock-db.js";
 import { buildApiApp } from "./test-helpers/build-api-app.js";
+import { SiteDeleted, SiteIngressChanged } from "./sync-management.js";
+import { PruneNow, deleteUnreferencedKubeTls } from "./prune.js";
 
 const mockClient = createMockClient();
 let mockFormFields = {};
@@ -47,6 +49,11 @@ vi.mock("./site-deployment-state.js", () => ({
     ManageIngressAdded: vi.fn(),
     LinkAddedOrDeleted: vi.fn(),
     ManageIngressDeleted: vi.fn(),
+}));
+
+vi.mock("./prune.js", () => ({
+    PruneNow: vi.fn(async () => {}),
+    deleteUnreferencedKubeTls: vi.fn(async () => {}),
 }));
 
 vi.mock("./db.js", async (importOriginal) => {
@@ -192,5 +199,140 @@ describe("api-admin", () => {
             .expect(201);
 
         expect(res.body).toEqual({ id: TEST_UUIDS.backbone });
+    });
+
+    it("DELETE /backbonesites/:sid removes kube tls objects and prunes", async () => {
+        const apCertId = "00000000-0000-4000-8000-000000000008";
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("FROM InteriorSites LEFT JOIN TlsCertificates")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            certificate: TEST_UUIDS.cert,
+                            colocated: false,
+                            objectname: "vms-interior-site-1",
+                        },
+                    ],
+                };
+            }
+            if (sql.includes("FROM BackboneAccessPoints LEFT JOIN TlsCertificates")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: TEST_UUIDS.accessPoint,
+                            certificate: apCertId,
+                            objectname: "vms-access-ap-1",
+                        },
+                    ],
+                };
+            }
+            return { rows: [], rowCount: 1 };
+        });
+
+        const { app } = await buildApiApp({ includeUser: false });
+
+        await request(app)
+            .delete(`/api/v1alpha1/backbonesites/${TEST_UUIDS.site}`)
+            .set("x-test-auth", "1")
+            .expect(204);
+
+        expect(SiteDeleted).toHaveBeenCalledWith(TEST_UUIDS.site, [TEST_UUIDS.accessPoint]);
+        expect(deleteUnreferencedKubeTls).toHaveBeenCalledWith([
+            "vms-interior-site-1",
+            "vms-access-ap-1",
+        ]);
+        expect(PruneNow).toHaveBeenCalled();
+    });
+
+    it("DELETE /backbonesites/:sid does not prune a colocated site", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("FROM InteriorSites LEFT JOIN TlsCertificates")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            certificate: TEST_UUIDS.cert,
+                            colocated: true,
+                            objectname: "vms-interior-colo",
+                        },
+                    ],
+                };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeUser: false });
+
+        await request(app)
+            .delete(`/api/v1alpha1/backbonesites/${TEST_UUIDS.site}`)
+            .set("x-test-auth", "1")
+            .expect(400);
+
+        expect(deleteUnreferencedKubeTls).not.toHaveBeenCalled();
+        expect(PruneNow).not.toHaveBeenCalled();
+        expect(SiteDeleted).not.toHaveBeenCalled();
+    });
+
+    it("DELETE /accesspoints/:apid prunes after deleting the access point", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("SELECT BackboneAccessPoints.Kind, InteriorSites.CoLocated")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ kind: "member", colocated: false }],
+                };
+            }
+            if (sql.includes("DELETE FROM BackboneAccessPoints WHERE Id")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            certificate: TEST_UUIDS.cert,
+                            kind: "member",
+                            interiorsite: TEST_UUIDS.site,
+                        },
+                    ],
+                };
+            }
+            return { rows: [], rowCount: 1 };
+        });
+
+        const { app } = await buildApiApp({ includeUser: false });
+
+        await request(app)
+            .delete(`/api/v1alpha1/accesspoints/${TEST_UUIDS.accessPoint}`)
+            .set("x-test-auth", "1")
+            .expect(204);
+
+        expect(PruneNow).toHaveBeenCalled();
+        expect(SiteIngressChanged).toHaveBeenCalledWith(TEST_UUIDS.site, TEST_UUIDS.accessPoint);
     });
 });

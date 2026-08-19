@@ -35,7 +35,39 @@ vi.mock("./notify.js", () => ({
     },
 }));
 
-import { DeleteOrphanCertificates } from "./prune.js";
+vi.mock("@vms/modules/kube", () => ({
+    GetIssuers: vi.fn(async () => []),
+    DeleteIssuer: vi.fn(),
+    GetCertificates: vi.fn(async () => []),
+    DeleteCertificate: vi.fn(),
+    GetSecrets: vi.fn(async () => []),
+    DeleteSecret: vi.fn(),
+}));
+
+import {
+    DeleteOrphanCertificates,
+    PruneNow,
+    deleteUnreferencedKubeTls,
+    reconcileCertificates,
+} from "./prune.js";
+import {
+    GetIssuers,
+    DeleteIssuer,
+    GetCertificates,
+    DeleteCertificate,
+    GetSecrets,
+    DeleteSecret,
+} from "@vms/modules/kube";
+import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
+
+function kubeObj(name, controlled = true) {
+    return {
+        metadata: {
+            name,
+            annotations: controlled ? { [META_ANNOTATION_VMS_CONTROLLED]: "true" } : {},
+        },
+    };
+}
 
 describe("DeleteOrphanCertificates", () => {
     beforeEach(() => {
@@ -98,5 +130,113 @@ describe("DeleteOrphanCertificates", () => {
             "DELETE FROM TlsCertificates WHERE Id = $1",
             ["revoked-cert"]
         );
+    });
+});
+
+describe("reconcileCertificates", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockResolvedValue({
+            rows: [{ objectname: "keep-me" }, { objectname: null }],
+        });
+        GetIssuers.mockResolvedValue([
+            kubeObj("keep-me"),
+            kubeObj("orphan-issuer"),
+            kubeObj("uncontrolled-issuer", false),
+        ]);
+        GetCertificates.mockResolvedValue([kubeObj("keep-me"), kubeObj("orphan-cert")]);
+        GetSecrets.mockResolvedValue([kubeObj("keep-me"), kubeObj("orphan-secret")]);
+        DeleteIssuer.mockResolvedValue({});
+        DeleteCertificate.mockResolvedValue({});
+        DeleteSecret.mockResolvedValue({});
+    });
+
+    it("deletes vms-controlled kube objects whose names are not in TlsCertificates", async () => {
+        await reconcileCertificates();
+
+        expect(DeleteIssuer).toHaveBeenCalledWith("orphan-issuer");
+        expect(DeleteIssuer).not.toHaveBeenCalledWith("keep-me");
+        expect(DeleteIssuer).not.toHaveBeenCalledWith("uncontrolled-issuer");
+        expect(DeleteCertificate).toHaveBeenCalledWith("orphan-cert");
+        expect(DeleteCertificate).not.toHaveBeenCalledWith("keep-me");
+        expect(DeleteSecret).toHaveBeenCalledWith("orphan-secret");
+        expect(DeleteSecret).not.toHaveBeenCalledWith("keep-me");
+        expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it("continues when a kube delete fails", async () => {
+        DeleteIssuer.mockRejectedValue(new Error("issuer gone"));
+
+        await reconcileCertificates();
+
+        expect(DeleteCertificate).toHaveBeenCalledWith("orphan-cert");
+        expect(DeleteSecret).toHaveBeenCalledWith("orphan-secret");
+    });
+});
+
+describe("deleteUnreferencedKubeTls", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        DeleteSecret.mockResolvedValue({});
+        DeleteCertificate.mockResolvedValue({});
+    });
+
+    it("skips kube delete when any TlsCertificates row still uses the object name", async () => {
+        mockClient.query.mockResolvedValue({
+            rows: [{ objectname: "vms-site-1" }],
+        });
+
+        await deleteUnreferencedKubeTls(["vms-site-1", "vms-access-1", "", "vms-site-1"]);
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "SELECT DISTINCT ObjectName FROM TlsCertificates WHERE ObjectName = ANY($1)",
+            [["vms-site-1", "vms-access-1"]]
+        );
+        expect(DeleteSecret).toHaveBeenCalledWith("vms-access-1");
+        expect(DeleteCertificate).toHaveBeenCalledWith("vms-access-1");
+        expect(DeleteSecret).not.toHaveBeenCalledWith("vms-site-1");
+        expect(DeleteCertificate).not.toHaveBeenCalledWith("vms-site-1");
+    });
+
+    it("does not query when there are no object names", async () => {
+        await deleteUnreferencedKubeTls(["", null]);
+
+        expect(mockClient.query).not.toHaveBeenCalled();
+        expect(DeleteSecret).not.toHaveBeenCalled();
+    });
+});
+
+describe("PruneNow", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("SELECT Id, SignedBy FROM TlsCertificates")) {
+                return { rows: [] };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM")) {
+                return { rows: [] };
+            }
+            if (sql.includes("SELECT ObjectName FROM TlsCertificates")) {
+                return { rows: [] };
+            }
+            return { rows: [] };
+        });
+        GetIssuers.mockResolvedValue([]);
+        GetCertificates.mockResolvedValue([]);
+        GetSecrets.mockResolvedValue([]);
+    });
+
+    it("deletes orphan db certs then reconciles kube objects", async () => {
+        await PruneNow();
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "DELETE FROM TlsClientRevocations WHERE Expiration IS NOT NULL AND Expiration < CURRENT_TIMESTAMP"
+        );
+        expect(GetIssuers).toHaveBeenCalled();
+        expect(GetCertificates).toHaveBeenCalled();
+        expect(GetSecrets).toHaveBeenCalled();
     });
 });
