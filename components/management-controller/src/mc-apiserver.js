@@ -34,6 +34,7 @@ import { ClientFromPool, queryWithContext } from "./db.js";
 import * as resourceTemplates from "./resource-templates.js";
 import { LoadSecret } from "@vms/modules/kube";
 import { RotateCertificate } from "./certs.js";
+import { RevokeCertificate } from "./tls-revoke.js";
 import { Log } from "@vms/modules/log";
 import * as sync from "./sync-management.js";
 import * as adminApi from "./api-admin.js";
@@ -450,6 +451,16 @@ const rotateCert = async function (req, res) {
     }
 };
 
+const revokeCert = async function (req, res) {
+    try {
+        const cert = await RevokeCertificate(req.params.cid);
+        res.status(200).json(cert);
+    } catch (err) {
+        const returnStatus = err.statusCode || 500;
+        res.status(returnStatus).send(err.message);
+    }
+};
+
 export async function AddHostToAccessPoint(req, siteId, apid, hostname, port) {
     let retval = 1;
     const client = await ClientFromPool();
@@ -672,6 +683,14 @@ export async function Initialize(router, auth) {
         auth.protect("realm:certificate-manager"),
         async (req, res) => {
             await rotateCert(req, res);
+        }
+    );
+
+    router.post(
+        API_PREFIX + "certs/:cid/revoke",
+        auth.protect("realm:certificate-manager"),
+        async (req, res) => {
+            await revokeCert(req, res);
         }
     );
 

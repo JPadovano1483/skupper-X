@@ -28,13 +28,12 @@ vi.mock("./watch-server.js", () => ({
     WatchNotify: vi.fn(),
 }));
 
-vi.mock("@vms/modules/kube", () => ({
-    DeleteCertificate: vi.fn(),
-    DeleteSecret: vi.fn(),
-}));
-
 vi.mock("./sync-management.js", () => ({
     MemberEvicted: vi.fn(async () => {}),
+}));
+
+vi.mock("./tls-revoke.js", () => ({
+    RevokeCertificate: vi.fn(async () => ({})),
 }));
 
 vi.mock("./db.js", async (importOriginal) => {
@@ -45,8 +44,8 @@ vi.mock("./db.js", async (importOriginal) => {
     };
 });
 
-import { DeleteCertificate, DeleteSecret } from "@vms/modules/kube";
 import { MemberEvicted } from "./sync-management.js";
+import { RevokeCertificate } from "./tls-revoke.js";
 
 describe("api-user", () => {
     beforeEach(() => {
@@ -207,20 +206,15 @@ describe("api-user", () => {
                 return {};
             }
             queries.push({ sql, params });
-            if (sql.includes("FROM MemberSites LEFT JOIN TlsCertificates")) {
+            if (sql.includes("SELECT Certificate FROM MemberSites WHERE Id")) {
                 return {
                     rowCount: 1,
                     rows: [
                         {
                             certificate: TEST_UUIDS.cert,
-                            objectname: "vms-member-test",
-                            expiration: new Date("2026-12-31T00:00:00.000Z"),
                         },
                     ],
                 };
-            }
-            if (sql.includes("INSERT INTO TlsClientRevocations")) {
-                return { rowCount: 1 };
             }
             if (sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")) {
                 return { rowCount: 1 };
@@ -236,19 +230,13 @@ describe("api-user", () => {
 
         expect(res.status).toBe(200);
         expect(
-            queries.some(
-                (query) =>
-                    query.sql.includes("INSERT INTO TlsClientRevocations") &&
-                    query.params[0] === TEST_UUIDS.cert
-            )
-        ).toBe(true);
-        expect(
             queries.some((query) =>
                 query.sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")
             )
         ).toBe(true);
-        expect(DeleteSecret).toHaveBeenCalledWith("vms-member-test");
-        expect(DeleteCertificate).toHaveBeenCalledWith("vms-member-test");
+        expect(RevokeCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert, {
+            reason: "Evicted via API",
+        });
         expect(MemberEvicted).toHaveBeenCalledWith(TEST_UUIDS.member);
     });
 
@@ -263,7 +251,7 @@ describe("api-user", () => {
             if (sql.includes("set_config")) {
                 return {};
             }
-            if (sql.includes("FROM MemberSites LEFT JOIN TlsCertificates")) {
+            if (sql.includes("SELECT Certificate FROM MemberSites WHERE Id")) {
                 return { rowCount: 0, rows: [] };
             }
             return { rows: [], rowCount: 0 };
@@ -276,6 +264,7 @@ describe("api-user", () => {
             .set("x-test-auth", "1");
 
         expect(res.status).toBe(404);
+        expect(RevokeCertificate).not.toHaveBeenCalled();
         expect(MemberEvicted).not.toHaveBeenCalled();
     });
 });

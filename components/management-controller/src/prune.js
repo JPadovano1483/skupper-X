@@ -31,6 +31,7 @@ import { Log } from "@vms/modules/log";
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
 import { ClientFromPool } from "./db.js";
 import { NotifyTransaction } from "./notify.js";
+import { deleteExpiredRevocations, listRevokedCertificateIds } from "./tls-revoke.js";
 
 const reconcileCertificates = async function () {
     const client = await ClientFromPool("system");
@@ -85,6 +86,7 @@ export async function DeleteOrphanCertificates() {
     const notify = new NotifyTransaction();
     try {
         await client.query("BEGIN");
+        await deleteExpiredRevocations(client);
         const deleteMap = {};
         const tlsResult = await client.query("SELECT Id, SignedBy FROM TlsCertificates");
         for (const tlsRow of tlsResult.rows) {
@@ -126,6 +128,13 @@ export async function DeleteOrphanCertificates() {
                         Log(`Record ${table}[${row.id}] references a non-exist TlsCertificate`);
                     }
                 }
+            }
+        }
+
+        // Revoked certificates stay until their revocation Expiration is purged above.
+        for (const certId of await listRevokedCertificateIds(client)) {
+            if (deleteMap[certId]) {
+                deleteMap[certId].pleaseDelete = false;
             }
         }
 

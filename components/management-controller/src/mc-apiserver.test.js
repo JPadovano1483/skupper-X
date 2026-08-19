@@ -22,6 +22,7 @@ import request from "supertest";
 import { createMockClient, TEST_UUIDS } from "./test-helpers/mock-db.js";
 import { buildApiApp } from "./test-helpers/build-api-app.js";
 import { RotateCertificate } from "./certs.js";
+import { RevokeCertificate } from "./tls-revoke.js";
 
 const mockClient = createMockClient();
 let mockFormFields = {};
@@ -46,6 +47,10 @@ vi.mock("./watch-server.js", () => ({
 
 vi.mock("./certs.js", () => ({
     RotateCertificate: vi.fn(),
+}));
+
+vi.mock("./tls-revoke.js", () => ({
+    RevokeCertificate: vi.fn(),
 }));
 
 vi.mock("./sync-management.js", async (importOriginal) => {
@@ -330,5 +335,64 @@ describe("mc-apiserver routes", () => {
             .expect(403);
 
         expect(RotateCertificate).not.toHaveBeenCalled();
+    });
+
+    it("POST /certs/:cid/revoke returns 200 and cert metadata", async () => {
+        const cert = {
+            id: TEST_UUIDS.cert,
+            objectname: "vms-interior-cert-1",
+            label: "site-a",
+            isca: false,
+        };
+        RevokeCertificate.mockResolvedValue(cert);
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        const res = await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/revoke`)
+            .set("x-test-auth", "1")
+            .expect(200);
+
+        expect(RevokeCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert);
+        expect(res.body).toEqual(cert);
+    });
+
+    it("POST /certs/:cid/revoke maps statusCode from RevokeCertificate", async () => {
+        const error = new Error("CA certificate revocation is not supported");
+        error.statusCode = 409;
+        RevokeCertificate.mockRejectedValue(error);
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        const res = await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/revoke`)
+            .set("x-test-auth", "1")
+            .expect(409);
+
+        expect(res.text).toBe("CA certificate revocation is not supported");
+    });
+
+    it("POST /certs/:cid/revoke requires certificate-manager", async () => {
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+            roles: ["admin"],
+        });
+
+        await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/revoke`)
+            .set("x-test-auth", "1")
+            .expect(403);
+
+        expect(RevokeCertificate).not.toHaveBeenCalled();
     });
 });

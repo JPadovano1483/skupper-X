@@ -44,8 +44,20 @@ import { RegisterHandler } from "./backbone-links.js";
 import { HashOfSecret, HashOfData } from "./resource-templates.js";
 import { SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
+import { isRevoked } from "./tls-revoke.js";
 
 const peers = {}; // {peerId: {pClass: <>, stuff}}
+
+async function hashIfLiveTls(client, certId, objectName, expired = false) {
+    if (expired || !certId || !objectName || (await isRevoked(client, certId))) {
+        return [null, null];
+    }
+    const secret = await LoadSecret(objectName);
+    if (!secret?.data) {
+        return [null, null];
+    }
+    return [HashOfSecret(secret), secret.data];
+}
 
 export async function GetBackboneLinks_TX(client, siteId) {
     const result = await client.query(
@@ -131,8 +143,8 @@ async function onNewBackboneSite(peerId) {
         const site = siteResult.rows[0];
         if (!site.colocated) {
             // Don't sync the site secret to colocated sites.
-            const secret = await LoadSecret(site.objectname);
-            localState[`tls-site-${peerId}`] = HashOfSecret(secret);
+            const [hash] = await hashIfLiveTls(client, site.certificate, site.objectname);
+            localState[`tls-site-${peerId}`] = hash;
         } else {
             // Do sync the list of managed VANs on the site's backbone
             const vanResult = await client.query(
@@ -178,8 +190,12 @@ async function onNewBackboneSite(peerId) {
                         `Access point in ready state does not have a TlsCertificate - ${accessPoint.id}`
                     );
                 }
-                const secret = await LoadSecret(tlsResult.rows[0].objectname);
-                localState[`tls-server-${accessPoint.id}`] = HashOfSecret(secret);
+                const [hash] = await hashIfLiveTls(
+                    client,
+                    accessPoint.certificate,
+                    tlsResult.rows[0].objectname
+                );
+                localState[`tls-server-${accessPoint.id}`] = hash;
                 remoteState[`accessstatus-${accessPoint.id}`] = HashOfData({
                     host: accessPoint.hostname,
                     port: accessPoint.port,
@@ -287,15 +303,17 @@ async function getStateTlsBackboneSite(siteId) {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT TlsCertificates.ObjectName FROM InteriorSites " +
+            "SELECT TlsCertificates.Id, TlsCertificates.ObjectName FROM InteriorSites " +
                 "JOIN TlsCertificates ON TlsCertificates.Id = Certificate " +
                 "WHERE InteriorSites.Id = $1",
             [siteId]
         );
         if (result.rowCount == 1) {
-            const secret = await LoadSecret(result.rows[0].objectname);
-            hash = HashOfSecret(secret);
-            data = secret.data;
+            [hash, data] = await hashIfLiveTls(
+                client,
+                result.rows[0].id,
+                result.rows[0].objectname
+            );
         }
         await client.query("COMMIT");
     } catch (error) {
@@ -315,15 +333,19 @@ async function getStateTlsMemberSite(siteId) {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT TlsCertificates.ObjectName FROM MemberSites " +
-                "JOIN TlsCertificates ON TlsCertificates.Id = Certificate " +
+            "SELECT MemberSites.Lifecycle, MemberSites.Certificate, TlsCertificates.ObjectName FROM MemberSites " +
+                "LEFT JOIN TlsCertificates ON TlsCertificates.Id = MemberSites.Certificate " +
                 "WHERE MemberSites.Id = $1",
             [siteId]
         );
         if (result.rowCount == 1) {
-            const secret = await LoadSecret(result.rows[0].objectname);
-            hash = HashOfSecret(secret);
-            data = secret.data;
+            const site = result.rows[0];
+            [hash, data] = await hashIfLiveTls(
+                client,
+                site.certificate,
+                site.objectname,
+                site.lifecycle == "expired"
+            );
         }
         await client.query("COMMIT");
     } catch (error) {
@@ -343,15 +365,17 @@ async function getStateTlsServer(apid) {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT TlsCertificates.ObjectName FROM BackboneAccessPoints " +
+            "SELECT TlsCertificates.Id, TlsCertificates.ObjectName FROM BackboneAccessPoints " +
                 "JOIN TlsCertificates ON TlsCertificates.Id = Certificate " +
                 "WHERE BackboneAccessPoints.Id = $1",
             [apid]
         );
         if (result.rowCount == 1) {
-            const secret = await LoadSecret(result.rows[0].objectname);
-            hash = HashOfSecret(secret);
-            data = secret.data;
+            [hash, data] = await hashIfLiveTls(
+                client,
+                result.rows[0].id,
+                result.rows[0].objectname
+            );
         }
         await client.query("COMMIT");
     } catch (error) {
@@ -529,7 +553,7 @@ async function onNewMember(peerId) {
         //
         const siteResult = await client.query(
             "SELECT Lifecycle, FirstActiveTime, Certificate, TlsCertificates.ObjectName FROM MemberSites " +
-                "JOIN TlsCertificates ON TlsCertificates.Id = MemberSites.Certificate " +
+                "LEFT JOIN TlsCertificates ON TlsCertificates.Id = MemberSites.Certificate " +
                 "WHERE MemberSites.Id = $1",
             [peerId]
         );
@@ -537,8 +561,14 @@ async function onNewMember(peerId) {
             throw new Error(`MemberSite not found using id ${peerId}`);
         }
         const site = siteResult.rows[0];
-        const secret = await LoadSecret(site.objectname);
-        localState[`tls-site-${peerId}`] = HashOfSecret(secret);
+        // Expired, revoked, and missing secrets must not be served or promoted to active.
+        const [tlsHash] = await hashIfLiveTls(
+            client,
+            site.certificate,
+            site.objectname,
+            site.lifecycle == "expired"
+        );
+        localState[`tls-site-${peerId}`] = tlsHash;
 
         //
         // Find the links from this member site.
@@ -561,7 +591,7 @@ async function onNewMember(peerId) {
         //
         // Update the timestamps and lifecycle on the member site
         //
-        if (site.lifecycle == "ready") {
+        if (site.lifecycle == "ready" && tlsHash) {
             await client.query(
                 "UPDATE MemberSites SET FirstActiveTime = CURRENT_TIMESTAMP, LastHeartbeat = CURRENT_TIMESTAMP, LifeCycle = 'active' WHERE Id = $1",
                 [peerId]
@@ -907,3 +937,9 @@ export async function Start() {
 export function _registerPeerForTest(peerId, peerClass = CLASS_BACKBONE) {
     peers[peerId] = { pClass: peerClass };
 }
+
+/** @internal Exported for unit tests */
+export {
+    onNewMember as _onNewMemberForTest,
+    getStateTlsMemberSite as _getStateTlsMemberSiteForTest,
+};

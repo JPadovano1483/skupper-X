@@ -40,6 +40,7 @@ import {
     CertOrganization,
 } from "./config.js";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
+import { refuseIfRevoked } from "./tls-revoke.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
@@ -1010,6 +1011,7 @@ export async function RotateCertificate(cid) {
         if (cert.isca) {
             throw httpError(409, "CA certificate rotation is not supported");
         }
+        await refuseIfRevoked(client, cid);
         if (!cert.objectname) {
             throw httpError(400, "Certificate has no Kubernetes object");
         }

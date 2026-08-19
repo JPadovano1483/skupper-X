@@ -683,10 +683,15 @@ describe("RotateCertificate", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mockClient.query.mockReset();
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
     });
 
     it("triggers cert-manager renewal for a leaf certificate", async () => {
-        mockClient.query.mockResolvedValue({ rowCount: 1, rows: [certRow] });
         TriggerCertificateRenewal.mockResolvedValue({});
 
         await expect(RotateCertificate(certId)).resolves.toEqual(certRow);
@@ -732,9 +737,11 @@ describe("RotateCertificate", () => {
     });
 
     it("rejects a certificate with no Kubernetes object name", async () => {
-        mockClient.query.mockResolvedValue({
-            rowCount: 1,
-            rows: [{ ...certRow, objectname: null }],
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [{ ...certRow, objectname: null }] };
         });
 
         await expect(RotateCertificate(certId)).rejects.toMatchObject({
@@ -744,8 +751,22 @@ describe("RotateCertificate", () => {
         expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
     });
 
+    it("refuses rotation of a revoked certificate", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 409,
+            message: "Certificate has been revoked",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
     it("maps a missing Certificate CR to 404", async () => {
-        mockClient.query.mockResolvedValue({ rowCount: 1, rows: [certRow] });
         const missing = new Error("not found");
         missing.statusCode = 404;
         TriggerCertificateRenewal.mockRejectedValue(missing);

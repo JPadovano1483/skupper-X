@@ -57,6 +57,8 @@ import {
     SiteIngressChanged,
     MemberEvicted,
     _registerPeerForTest,
+    _onNewMemberForTest,
+    _getStateTlsMemberSiteForTest,
 } from "./sync-management.js";
 import { DeletePeer, UpdateLocalState } from "@vms/modules/state-sync";
 import { LoadSecret } from "@vms/modules/kube";
@@ -317,5 +319,144 @@ describe("MemberEvicted", () => {
         await MemberEvicted("member-1");
 
         expect(UpdateLocalState).toHaveBeenCalledWith("member-1", "tls-site-member-1", null);
+    });
+});
+
+function memberTlsQueryHandler({
+    lifecycle = "ready",
+    certificate = "cert-1",
+    objectname = "member-tls-secret",
+    revoked = false,
+} = {}) {
+    return async (sql) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+            return {};
+        }
+        if (sql.includes("FROM TlsClientRevocations")) {
+            return { rowCount: revoked ? 1 : 0, rows: revoked ? [{}] : [] };
+        }
+        if (sql.includes("FROM MemberSites") && sql.includes("TlsCertificates")) {
+            return {
+                rowCount: 1,
+                rows: [
+                    {
+                        lifecycle,
+                        firstactivetime: null,
+                        certificate,
+                        objectname,
+                    },
+                ],
+            };
+        }
+        if (sql.includes("FROM EdgeLinks")) {
+            return { rows: [] };
+        }
+        if (sql.includes("UPDATE MemberSites")) {
+            return { rowCount: 1 };
+        }
+        return { rows: [] };
+    };
+}
+
+describe("getStateTlsMemberSite", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        LoadSecret.mockResolvedValue({
+            data: { "tls.crt": Buffer.from("member-cert").toString("base64") },
+        });
+    });
+
+    it("returns a secret hash for an active member", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "active" }));
+
+        const [hash, data] = await _getStateTlsMemberSiteForTest("member-1");
+
+        expect(LoadSecret).toHaveBeenCalledWith("member-tls-secret");
+        expect(hash).toMatch(/^[a-f0-9]{40}$/);
+        expect(data).toEqual({ "tls.crt": Buffer.from("member-cert").toString("base64") });
+    });
+
+    it("returns a null hash for an expired member without loading the secret", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "expired" }));
+
+        const [hash, data] = await _getStateTlsMemberSiteForTest("member-1");
+
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(hash).toBeNull();
+        expect(data).toBeNull();
+    });
+
+    it("returns a null hash for a revoked certificate without loading the secret", async () => {
+        mockClient.query.mockImplementation(
+            memberTlsQueryHandler({ lifecycle: "active", revoked: true })
+        );
+
+        const [hash, data] = await _getStateTlsMemberSiteForTest("member-1");
+
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(hash).toBeNull();
+        expect(data).toBeNull();
+    });
+
+    it("returns a null hash when the kube secret is missing", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "active" }));
+        LoadSecret.mockResolvedValue(undefined);
+
+        const [hash, data] = await _getStateTlsMemberSiteForTest("member-1");
+
+        expect(hash).toBeNull();
+        expect(data).toBeNull();
+    });
+});
+
+describe("onNewMember", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        LoadSecret.mockResolvedValue({
+            data: { "tls.crt": Buffer.from("member-cert").toString("base64") },
+        });
+    });
+
+    it("loads the secret and promotes a ready member to active", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "ready" }));
+
+        const [localState] = await _onNewMemberForTest("member-1");
+
+        expect(LoadSecret).toHaveBeenCalledWith("member-tls-secret");
+        expect(localState["tls-site-member-1"]).toMatch(/^[a-f0-9]{40}$/);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("LifeCycle = 'active'"),
+            ["member-1"]
+        );
+    });
+
+    it("advertises a null tls-site hash for expired members and does not promote them", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "expired" }));
+
+        const [localState] = await _onNewMemberForTest("member-1");
+
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(localState["tls-site-member-1"]).toBeNull();
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("LifeCycle = 'active'"),
+            expect.anything()
+        );
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("LastHeartbeat = CURRENT_TIMESTAMP WHERE Id = $1"),
+            ["member-1"]
+        );
+    });
+
+    it("advertises a null tls-site hash for revoked certs and does not load the secret", async () => {
+        mockClient.query.mockImplementation(
+            memberTlsQueryHandler({ lifecycle: "active", revoked: true })
+        );
+
+        const [localState] = await _onNewMemberForTest("member-1");
+
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(localState["tls-site-member-1"]).toBeNull();
     });
 });

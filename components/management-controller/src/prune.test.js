@@ -60,9 +60,43 @@ describe("DeleteOrphanCertificates", () => {
     it("deletes tls certificates not referenced by other tables", async () => {
         await DeleteOrphanCertificates();
 
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "DELETE FROM TlsClientRevocations WHERE Expiration IS NOT NULL AND Expiration < CURRENT_TIMESTAMP"
+        );
         expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
             "orphan-cert",
         ]);
         expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it("does not delete certificates that still have a revocation row", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("DELETE FROM TlsClientRevocations")) {
+                return { rowCount: 0 };
+            }
+            if (sql.includes("SELECT Id, SignedBy FROM TlsCertificates")) {
+                return { rows: [{ id: "revoked-cert", signedby: null }] };
+            }
+            if (sql.includes("SELECT CertificateId FROM TlsClientRevocations")) {
+                return { rows: [{ certificateid: "revoked-cert" }] };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM")) {
+                return { rows: [] };
+            }
+            if (sql.startsWith("DELETE FROM TlsCertificates")) {
+                return { rowCount: 1 };
+            }
+            return { rows: [] };
+        });
+
+        await DeleteOrphanCertificates();
+
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            "DELETE FROM TlsCertificates WHERE Id = $1",
+            ["revoked-cert"]
+        );
     });
 });
