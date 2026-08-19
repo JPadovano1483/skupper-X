@@ -5,7 +5,7 @@
 - ~~Deleting sites and backbones causes exceptions to be repeatedly caught in the management controller~~
 - ~~There is a name-collision thing happening when a backbone is deleted and then re-created~~
 - Multiple Access Points can be created on the same site with the same name
-- Claim against an expired invitation is honored
+- ~~Claim against an expired invitation is honored~~
 
 ## General Stuff
 

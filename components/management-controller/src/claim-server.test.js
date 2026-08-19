@@ -17,7 +17,7 @@
  under the License.
 */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createMockClient } from "./test-helpers/mock-db.js";
 
 const mockClient = createMockClient();
@@ -102,7 +102,11 @@ describe("CompleteMember", () => {
 });
 
 describe("_processClaimForTest", () => {
-    it("rejects claims against invitations with lifecycle expired", async () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    function mockInvitationQuery(rows, { revoked = false } = {}) {
         let invitationSql;
         mockClient.query.mockImplementation(async (sql) => {
             if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
@@ -110,15 +114,65 @@ describe("_processClaimForTest", () => {
             }
             if (sql.includes("FROM MemberInvitations")) {
                 invitationSql = sql;
-                return { rowCount: 0, rows: [] };
+                return { rowCount: rows.length, rows };
+            }
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return revoked ? { rowCount: 1, rows: [{}] } : { rowCount: 0, rows: [] };
             }
             return { rows: [] };
         });
+        return () => invitationSql;
+    }
+
+    const liveInvitation = {
+        id: "inv-1",
+        memberof: "van-1",
+        memberclasses: [],
+        instancelimit: null,
+        instancecount: 0,
+        certificate: "cert-1",
+        certexpiration: new Date(Date.now() + 86400000),
+    };
+
+    it("rejects claims against invitations with lifecycle expired", async () => {
+        const getInvitationSql = mockInvitationQuery([]);
 
         const [statusCode, statusDescription] = await _processClaimForTest("inv-expired", "site-a");
 
-        expect(invitationSql).toContain("LifeCycle != 'expired'");
+        expect(getInvitationSql()).toContain("LifeCycle != 'expired'");
+        expect(getInvitationSql()).toContain("LEFT JOIN TlsCertificates");
         expect(statusCode).toBe(400);
         expect(statusDescription).toContain("No valid invitation exists for the claim");
+    });
+
+    it("rejects claims when JoinDeadline has passed", async () => {
+        const getInvitationSql = mockInvitationQuery([]);
+
+        const [statusCode, statusDescription] = await _processClaimForTest(
+            "inv-deadline-past",
+            "site-a"
+        );
+
+        expect(getInvitationSql()).toContain("(JoinDeadline IS NULL OR JoinDeadline > now())");
+        expect(statusCode).toBe(400);
+        expect(statusDescription).toContain("No valid invitation exists for the claim");
+    });
+
+    it("rejects claims when the invitation certificate is revoked", async () => {
+        mockInvitationQuery([liveInvitation], { revoked: true });
+
+        const [statusCode, statusDescription] = await _processClaimForTest("inv-1", "site-a");
+
+        expect(statusCode).toBe(400);
+        expect(statusDescription).toContain("Invitation certificate has been revoked");
+    });
+
+    it("rejects claims when the invitation certificate has expired", async () => {
+        mockInvitationQuery([{ ...liveInvitation, certexpiration: new Date(Date.now() - 1000) }]);
+
+        const [statusCode, statusDescription] = await _processClaimForTest("inv-1", "site-a");
+
+        expect(statusCode).toBe(400);
+        expect(statusDescription).toContain("Invitation certificate has expired");
     });
 });

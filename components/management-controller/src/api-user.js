@@ -520,16 +520,28 @@ const expireInvitation = async function (req, res) {
     let returnStatus = 200;
     const client = await ClientFromPool();
     const notify = new NotifyTransaction();
+    let certificate;
     try {
         const result = await queryWithContext(req, client, async (client) => {
             notify.update("MemberInvitations", iid);
             return await client.query(
-                "UPDATE MemberInvitations SET Lifecycle = 'expired', Failure = 'Expired via API' WHERE Id = $1 RETURNING Id",
+                "UPDATE MemberInvitations SET Lifecycle = 'expired', Failure = 'Expired via API' WHERE Id = $1 RETURNING Id, Certificate",
                 [iid]
             );
         });
         if (result.rowCount == 0) {
             returnStatus = 404;
+        } else {
+            certificate = result.rows[0].certificate;
+        }
+        if (certificate) {
+            try {
+                await RevokeCertificate(certificate, { reason: "Invitation expired via API" });
+            } catch (error) {
+                Log(
+                    `WARN: Failed to revoke invitation cert ${certificate} for ${iid}: ${error.message}`
+                );
+            }
         }
         res.status(returnStatus).end();
         await notify.commit();

@@ -267,4 +267,100 @@ describe("api-user", () => {
         expect(RevokeCertificate).not.toHaveBeenCalled();
         expect(MemberEvicted).not.toHaveBeenCalled();
     });
+
+    it("PUT /invitations/:iid/expire revokes the claim cert", async () => {
+        const queries = [];
+        mockClient.query.mockImplementation(async (sql, params) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            queries.push({ sql, params });
+            if (sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ id: TEST_UUIDS.invitation, certificate: TEST_UUIDS.cert }],
+                };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/invitations/${TEST_UUIDS.invitation}/expire`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(200);
+        expect(
+            queries.some((query) =>
+                query.sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")
+            )
+        ).toBe(true);
+        expect(RevokeCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert, {
+            reason: "Invitation expired via API",
+        });
+    });
+
+    it("PUT /invitations/:iid/expire returns 404 when invitation is missing", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/invitations/${TEST_UUIDS.invitation}/expire`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(404);
+        expect(RevokeCertificate).not.toHaveBeenCalled();
+    });
+
+    it("PUT /invitations/:iid/expire does not revoke when invitation has no cert", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ id: TEST_UUIDS.invitation, certificate: null }],
+                };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/invitations/${TEST_UUIDS.invitation}/expire`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(200);
+        expect(RevokeCertificate).not.toHaveBeenCalled();
+    });
 });

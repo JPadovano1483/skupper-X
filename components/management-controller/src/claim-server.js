@@ -42,6 +42,7 @@ import { DispatchMessage, AssertClaimResponseSuccess, ReponseFailure } from "@vm
 import { RegisterHandler } from "./backbone-links.js";
 import { HashOfData } from "./resource-templates.js";
 import { NotifyTransaction } from "./notify.js";
+import { isRevoked } from "./tls-revoke.js";
 
 const backbones = {}; // backboneId => {conn: AMQP-Connection, sender: anon-sender, receiver: claim-receiver}
 const memberCompletions = {}; // memberId   => {handler: completion-function, result: undefined || {}, error: undefined || ERROR }
@@ -168,7 +169,9 @@ const processClaim = async function (claimId, name) {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT * FROM MemberInvitations WHERE Id = $1 AND LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
+            "SELECT MemberInvitations.*, TlsCertificates.Expiration AS certexpiration FROM MemberInvitations " +
+                "LEFT JOIN TlsCertificates ON TlsCertificates.Id = MemberInvitations.Certificate " +
+                "WHERE MemberInvitations.Id = $1 AND MemberInvitations.LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
             [claimId]
         );
         if (result.rowCount != 1) {
@@ -176,9 +179,21 @@ const processClaim = async function (claimId, name) {
         }
 
         //
-        // Reject the claim if the instance limit has already been reached
+        // Reject the claim if the invitation certificate is revoked or past its expiration
         //
         const claim = result.rows[0];
+        if (claim.certificate) {
+            if (await isRevoked(client, claim.certificate)) {
+                throw new Error("Invitation certificate has been revoked");
+            }
+            if (claim.certexpiration && new Date(claim.certexpiration) <= new Date()) {
+                throw new Error("Invitation certificate has expired");
+            }
+        }
+
+        //
+        // Reject the claim if the instance limit has already been reached
+        //
         if (claim.instancelimit && claim.instancecount == claim.instancelimit) {
             throw new Error("Instance limit on this claim has been reached");
         }
