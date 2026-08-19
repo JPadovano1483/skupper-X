@@ -617,8 +617,25 @@ async function onNewMember(peerId) {
     return [localState, remoteState];
 }
 
-async function onLostMember(_peerId) {
-    // TODO
+async function onLostMember(peerId) {
+    const client = await ClientFromPool("system");
+    const notify = new NotifyTransaction();
+    try {
+        await client.query("BEGIN");
+        await client.query(
+            "UPDATE MemberSites SET LastHeartbeat = CURRENT_TIMESTAMP WHERE Id = $1",
+            [peerId]
+        );
+        notify.update("MemberSites", peerId);
+        await client.query("COMMIT");
+        await notify.commit();
+    } catch (error) {
+        await client.query("ROLLBACK");
+        Log(`Exception in onLostMember processing: ${error.message}`);
+        Log(error.stack);
+    } finally {
+        client.release();
+    }
 }
 
 async function onStateChangeMember(_peerId, _stateKey, _hash, _data) {
@@ -910,8 +927,35 @@ async function onApplicationNetworkChange(action, id) {
     }
 }
 
-export async function SiteDeleted(siteId) {
-    DeletePeer(siteId);
+async function listAccessPointIds(siteId) {
+    const client = await ClientFromPool("system");
+    try {
+        const result = await client.query(
+            "SELECT Id FROM BackboneAccessPoints WHERE InteriorSite = $1",
+            [siteId]
+        );
+        return result.rows.map((row) => row.id);
+    } finally {
+        client.release();
+    }
+}
+
+export async function SiteDeleted(siteId, accessPointIds) {
+    await UpdateLocalState(siteId, `tls-site-${siteId}`, null);
+    let serverIds = accessPointIds;
+    if (serverIds === undefined) {
+        try {
+            serverIds = await listAccessPointIds(siteId);
+        } catch (error) {
+            Log(`Exception in SiteDeleted processing: ${error.message}`);
+            Log(error.stack);
+            serverIds = [];
+        }
+    }
+    for (const apId of serverIds) {
+        await UpdateLocalState(siteId, `tls-server-${apId}`, null);
+    }
+    await DeletePeer(siteId);
 }
 
 export async function MemberEvicted(memberId) {
@@ -941,5 +985,6 @@ export function _registerPeerForTest(peerId, peerClass = CLASS_BACKBONE) {
 /** @internal Exported for unit tests */
 export {
     onNewMember as _onNewMemberForTest,
+    onLostMember as _onLostMemberForTest,
     getStateTlsMemberSite as _getStateTlsMemberSiteForTest,
 };

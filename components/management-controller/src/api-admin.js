@@ -542,6 +542,7 @@ const deleteBackboneSite = async function (req, res) {
             throw new Error("Site-Id is not a valid uuid");
         }
 
+        let accessPointIds = [];
         await queryWithContext(req, client, async (client) => {
             const result = await client.query(
                 "SELECT Certificate, CoLocated FROM InteriorSites WHERE Id = $1",
@@ -564,6 +565,7 @@ const deleteBackboneSite = async function (req, res) {
                     "SELECT Id, Certificate FROM BackboneAccessPoints WHERE InteriorSite = $1",
                     [sid]
                 );
+                accessPointIds = apResult.rows.map((ap) => ap.id);
                 for (const row of apResult.rows) {
                     if (row.certificate) {
                         await client.query(
@@ -600,8 +602,9 @@ const deleteBackboneSite = async function (req, res) {
 
         //
         // Notify the state-sync module that the site is no longer here.
+        // Access-point ids are passed because those rows are already deleted.
         //
-        SiteDeleted(sid);
+        await SiteDeleted(sid, accessPointIds);
 
         res.status(returnStatus).end();
         await notify.commit();

@@ -58,6 +58,7 @@ import {
     MemberEvicted,
     _registerPeerForTest,
     _onNewMemberForTest,
+    _onLostMemberForTest,
     _getStateTlsMemberSiteForTest,
 } from "./sync-management.js";
 import { DeletePeer, UpdateLocalState } from "@vms/modules/state-sync";
@@ -171,9 +172,43 @@ describe("GetBackboneAccessPoints_TX", () => {
 });
 
 describe("SiteDeleted", () => {
-    it("calls DeletePeer for the site id", async () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        mockClient.query.mockResolvedValue({ rows: [] });
+    });
+
+    it("nulls tls-site and tls-server state before DeletePeer", async () => {
+        mockClient.query.mockResolvedValue({
+            rows: [{ id: "ap-1" }, { id: "ap-2" }],
+        });
+
         await SiteDeleted("site-1");
 
+        expect(UpdateLocalState).toHaveBeenCalledWith("site-1", "tls-site-site-1", null);
+        expect(UpdateLocalState).toHaveBeenCalledWith("site-1", "tls-server-ap-1", null);
+        expect(UpdateLocalState).toHaveBeenCalledWith("site-1", "tls-server-ap-2", null);
+        expect(DeletePeer).toHaveBeenCalledWith("site-1");
+        expect(UpdateLocalState.mock.invocationCallOrder[0]).toBeLessThan(
+            DeletePeer.mock.invocationCallOrder[0]
+        );
+    });
+
+    it("uses provided access point ids without querying", async () => {
+        await SiteDeleted("site-1", ["ap-9"]);
+
+        expect(mockClient.query).not.toHaveBeenCalled();
+        expect(UpdateLocalState).toHaveBeenCalledWith("site-1", "tls-site-site-1", null);
+        expect(UpdateLocalState).toHaveBeenCalledWith("site-1", "tls-server-ap-9", null);
+        expect(DeletePeer).toHaveBeenCalledWith("site-1");
+    });
+
+    it("still deletes the peer when access-point lookup fails", async () => {
+        mockClient.query.mockRejectedValue(new Error("db down"));
+
+        await SiteDeleted("site-1");
+
+        expect(UpdateLocalState).toHaveBeenCalledWith("site-1", "tls-site-site-1", null);
         expect(DeletePeer).toHaveBeenCalledWith("site-1");
     });
 });
@@ -320,6 +355,16 @@ describe("MemberEvicted", () => {
 
         expect(UpdateLocalState).toHaveBeenCalledWith("member-1", "tls-site-member-1", null);
     });
+
+    it("does not throw when the peer is unknown", async () => {
+        await expect(MemberEvicted("offline-member")).resolves.toBeUndefined();
+
+        expect(UpdateLocalState).toHaveBeenCalledWith(
+            "offline-member",
+            "tls-site-offline-member",
+            null
+        );
+    });
 });
 
 function memberTlsQueryHandler({
@@ -458,5 +503,63 @@ describe("onNewMember", () => {
 
         expect(LoadSecret).not.toHaveBeenCalled();
         expect(localState["tls-site-member-1"]).toBeNull();
+    });
+
+    it("does not load the secret when an evicted member reconnects", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "expired" }));
+
+        const [localState] = await _onNewMemberForTest("member-1");
+
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(localState["tls-site-member-1"]).toBeNull();
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("LifeCycle = 'active'"),
+            expect.anything()
+        );
+    });
+
+    it("advertises a null tls-site hash when the kube secret is missing", async () => {
+        mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "active" }));
+        LoadSecret.mockResolvedValue(undefined);
+
+        const [localState] = await _onNewMemberForTest("member-1");
+
+        expect(localState["tls-site-member-1"]).toBeNull();
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("LifeCycle = 'active'"),
+            expect.anything()
+        );
+    });
+});
+
+describe("onLostMember", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("UPDATE MemberSites")) {
+                return { rowCount: 1 };
+            }
+            return { rows: [] };
+        });
+    });
+
+    it("updates LastHeartbeat without resurrecting certs or lifecycle", async () => {
+        await _onLostMemberForTest("member-1");
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("LastHeartbeat = CURRENT_TIMESTAMP WHERE Id = $1"),
+            ["member-1"]
+        );
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("LifeCycle = 'active'"),
+            expect.anything()
+        );
+        expect(LoadSecret).not.toHaveBeenCalled();
+        expect(UpdateLocalState).not.toHaveBeenCalled();
+        expect(mockClient.release).toHaveBeenCalled();
     });
 });
