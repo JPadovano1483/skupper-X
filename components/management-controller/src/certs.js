@@ -23,6 +23,8 @@ import {
     ApplyObject,
     LoadCertificate,
     TriggerCertificateRenewal,
+    ReplaceCertificate,
+    setCertificateDnsName,
     WatchSecrets,
     WatchCertificates,
     GetIssuers,
@@ -988,6 +990,21 @@ function kubeStatusCode(err) {
     return err?.statusCode || err?.code || err?.response?.statusCode;
 }
 
+async function syncAccessPointDnsNames(client, certId, objectName) {
+    const apResult = await client.query(
+        "SELECT Hostname FROM BackboneAccessPoints WHERE Certificate = $1 AND Hostname IS NOT NULL",
+        [certId]
+    );
+    if (apResult.rowCount != 1) {
+        return;
+    }
+    const kubeCert = await LoadCertificate(objectName);
+    const updated = setCertificateDnsName(kubeCert, apResult.rows[0].hostname);
+    if (updated) {
+        await ReplaceCertificate(updated);
+    }
+}
+
 //
 // Force in-place cert-manager renewal for an existing TlsCertificates row.
 // Does not insert CertificateRequests — that would create a differently
@@ -1017,6 +1034,7 @@ export async function RotateCertificate(cid) {
         }
         Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
         try {
+            await syncAccessPointDnsNames(client, cid, cert.objectname);
             await TriggerCertificateRenewal(cert.objectname);
         } catch (err) {
             if (kubeStatusCode(err) == 404) {

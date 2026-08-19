@@ -43,6 +43,8 @@ import {
     insertRevocation,
     deleteExpiredRevocations,
     listRevokedCertificateIds,
+    dropAccessPointCertificate,
+    deleteKubeTlsObjectList,
     advertiseTlsRevoked,
     RevokeCertificate,
 } from "./tls-revoke.js";
@@ -239,5 +241,110 @@ describe("RevokeCertificate", () => {
             expect.stringContaining("INSERT INTO TlsClientRevocations"),
             [CERT_ID, certRow.expiration, "Evicted via API"]
         );
+    });
+});
+
+describe("dropAccessPointCertificate", () => {
+    const notify = {
+        delete: vi.fn(),
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        notify.delete.mockReset();
+    });
+
+    it("unlinks and deletes the issued certificate", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM CertificateRequests")) {
+                return { rows: [] };
+            }
+            if (sql.includes("SELECT Certificate FROM BackboneAccessPoints")) {
+                return { rows: [{ certificate: CERT_ID }] };
+            }
+            if (sql.includes("FROM TlsCertificates")) {
+                return { rowCount: 1, rows: [{ objectname: "vms-access-req-1" }] };
+            }
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1 };
+        });
+
+        const objectNames = await dropAccessPointCertificate(mockClient, notify, "ap-1");
+
+        expect(objectNames).toEqual(["vms-access-req-1"]);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "UPDATE BackboneAccessPoints SET Certificate = NULL WHERE Id = $1",
+            ["ap-1"]
+        );
+        expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
+            CERT_ID,
+        ]);
+        expect(notify.delete).toHaveBeenCalledWith("TlsCertificates", CERT_ID);
+    });
+
+    it("cancels pending certificate requests and keeps revoked rows", async () => {
+        const requestId = "00000000-0000-4000-8000-000000000009";
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM CertificateRequests WHERE AccessPoint")) {
+                return { rows: [{ id: requestId }] };
+            }
+            if (sql.includes("SELECT Certificate FROM BackboneAccessPoints")) {
+                return { rows: [{ certificate: CERT_ID }] };
+            }
+            if (sql.includes("FROM TlsCertificates")) {
+                return { rowCount: 1, rows: [{ objectname: "vms-access-issued" }] };
+            }
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            return { rowCount: 1 };
+        });
+
+        const objectNames = await dropAccessPointCertificate(mockClient, notify, "ap-1");
+
+        expect(objectNames).toEqual([`vms-access-${requestId}`, "vms-access-issued"]);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "DELETE FROM CertificateRequests WHERE Id = $1",
+            [requestId]
+        );
+        expect(notify.delete).toHaveBeenCalledWith("CertificateRequests", requestId);
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            "DELETE FROM TlsCertificates WHERE Id = $1",
+            [CERT_ID]
+        );
+    });
+
+    it("returns an empty list when the access point has no certificate", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM CertificateRequests")) {
+                return { rows: [] };
+            }
+            if (sql.includes("SELECT Certificate FROM BackboneAccessPoints")) {
+                return { rows: [{ certificate: null }] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        expect(await dropAccessPointCertificate(mockClient, notify, "ap-1")).toEqual([]);
+        expect(notify.delete).not.toHaveBeenCalled();
+    });
+});
+
+describe("deleteKubeTlsObjectList", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        DeleteSecret.mockResolvedValue({});
+        DeleteCertificate.mockResolvedValue({});
+    });
+
+    it("deletes unique kube objects and ignores blanks", async () => {
+        await deleteKubeTlsObjectList(["vms-access-a", "", "vms-access-a", "vms-access-b"]);
+
+        expect(DeleteSecret).toHaveBeenCalledTimes(2);
+        expect(DeleteCertificate).toHaveBeenCalledTimes(2);
+        expect(DeleteSecret).toHaveBeenCalledWith("vms-access-a");
+        expect(DeleteSecret).toHaveBeenCalledWith("vms-access-b");
     });
 });

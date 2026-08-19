@@ -26,6 +26,8 @@ vi.mock("@vms/modules/state-sync", () => ({
 
 vi.mock("@vms/modules/kube", () => ({
     LoadSecret: vi.fn(),
+    DeleteSecret: vi.fn(),
+    DeleteCertificate: vi.fn(),
 }));
 
 vi.mock("./backbone-links.js", () => ({
@@ -35,7 +37,9 @@ vi.mock("./backbone-links.js", () => ({
 vi.mock("./notify.js", () => ({
     RegisterNotification: vi.fn(),
     NotifyTransaction: class {
+        add() {}
         update() {}
+        delete() {}
         async commit() {}
     },
 }));
@@ -60,9 +64,10 @@ import {
     _onNewMemberForTest,
     _onLostMemberForTest,
     _getStateTlsMemberSiteForTest,
+    _onStateChangeBackboneForTest,
 } from "./sync-management.js";
 import { DeletePeer, UpdateLocalState } from "@vms/modules/state-sync";
-import { LoadSecret } from "@vms/modules/kube";
+import { LoadSecret, DeleteSecret, DeleteCertificate } from "@vms/modules/kube";
 
 describe("GetBackboneLinks_TX", () => {
     it("returns links keyed by id with hostname", async () => {
@@ -561,5 +566,177 @@ describe("onLostMember", () => {
         expect(LoadSecret).not.toHaveBeenCalled();
         expect(UpdateLocalState).not.toHaveBeenCalled();
         expect(mockClient.release).toHaveBeenCalled();
+    });
+});
+
+function accessStatusQueryHandler({
+    found = true,
+    lifecycle = "ready",
+    hostname = "old.example.com",
+    port = "9090",
+    certificate = "cert-ap-1",
+    objectname = "vms-access-req-1",
+    pendingRequests = [],
+    revoked = false,
+} = {}) {
+    return async (sql) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+            return {};
+        }
+        if (
+            sql.includes(
+                "SELECT Id, Lifecycle, Hostname, Port, Certificate FROM BackboneAccessPoints"
+            )
+        ) {
+            if (!found) {
+                return { rowCount: 0, rows: [] };
+            }
+            return {
+                rowCount: 1,
+                rows: [
+                    {
+                        id: "ap-1",
+                        lifecycle,
+                        hostname,
+                        port,
+                        certificate,
+                    },
+                ],
+            };
+        }
+        if (sql.includes("FROM CertificateRequests WHERE AccessPoint")) {
+            return { rows: pendingRequests.map((id) => ({ id })) };
+        }
+        if (sql.includes("SELECT Certificate FROM BackboneAccessPoints")) {
+            return { rows: [{ certificate }] };
+        }
+        if (sql.includes("FROM TlsCertificates WHERE Id")) {
+            return {
+                rowCount: objectname ? 1 : 0,
+                rows: objectname ? [{ objectname }] : [],
+            };
+        }
+        if (sql.includes("FROM TlsClientRevocations")) {
+            return { rowCount: revoked ? 1 : 0, rows: revoked ? [{}] : [] };
+        }
+        if (sql.includes("UPDATE BackboneAccessPoints")) {
+            return { rowCount: 1 };
+        }
+        if (
+            sql.includes("DELETE FROM TlsCertificates") ||
+            sql.includes("DELETE FROM CertificateRequests")
+        ) {
+            return { rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+    };
+}
+
+describe("onStateChangeBackbone", () => {
+    const siteId = "site-1";
+    const accessId = "ap-1";
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        DeleteSecret.mockResolvedValue({});
+        DeleteCertificate.mockResolvedValue({});
+    });
+
+    it("sets host/port and lifecycle new for a partial access point", async () => {
+        mockClient.query.mockImplementation(
+            accessStatusQueryHandler({
+                lifecycle: "partial",
+                hostname: null,
+                port: null,
+                certificate: null,
+                objectname: null,
+            })
+        );
+
+        await _onStateChangeBackboneForTest(siteId, `accessstatus-${accessId}`, "hash-1", {
+            host: "router.example.com",
+            port: 9090,
+        });
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("Lifecycle = 'new'"),
+            ["router.example.com", 9090, accessId]
+        );
+        expect(DeleteSecret).not.toHaveBeenCalled();
+        expect(DeleteCertificate).not.toHaveBeenCalled();
+        expect(UpdateLocalState).not.toHaveBeenCalled();
+    });
+
+    it("deletes the TLS cert and re-issues when a ready access point hostname changes", async () => {
+        mockClient.query.mockImplementation(accessStatusQueryHandler());
+
+        await _onStateChangeBackboneForTest(siteId, `accessstatus-${accessId}`, "hash-2", {
+            host: "new.example.com",
+            port: 9090,
+        });
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "UPDATE BackboneAccessPoints SET Certificate = NULL WHERE Id = $1",
+            [accessId]
+        );
+        expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
+            "cert-ap-1",
+        ]);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("Lifecycle = 'new'"),
+            ["new.example.com", 9090, accessId]
+        );
+        expect(DeleteSecret).toHaveBeenCalledWith("vms-access-req-1");
+        expect(DeleteCertificate).toHaveBeenCalledWith("vms-access-req-1");
+        expect(UpdateLocalState).toHaveBeenCalledWith(siteId, `tls-server-${accessId}`, null);
+    });
+
+    it("returns the access point to partial and drops the cert when host/port is deleted", async () => {
+        mockClient.query.mockImplementation(accessStatusQueryHandler());
+
+        await _onStateChangeBackboneForTest(siteId, `accessstatus-${accessId}`, null, {});
+
+        expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
+            "cert-ap-1",
+        ]);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("Lifecycle = 'partial'"),
+            [accessId]
+        );
+        expect(DeleteSecret).toHaveBeenCalledWith("vms-access-req-1");
+        expect(DeleteCertificate).toHaveBeenCalledWith("vms-access-req-1");
+        expect(UpdateLocalState).toHaveBeenCalledWith(siteId, `tls-server-${accessId}`, null);
+    });
+
+    it("ignores host/port deletion when the access point row is already gone", async () => {
+        mockClient.query.mockImplementation(accessStatusQueryHandler({ found: false }));
+
+        await expect(
+            _onStateChangeBackboneForTest(siteId, `accessstatus-${accessId}`, null, {})
+        ).resolves.toBeUndefined();
+
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("Lifecycle = 'partial'"),
+            expect.anything()
+        );
+        expect(DeleteSecret).not.toHaveBeenCalled();
+        expect(UpdateLocalState).not.toHaveBeenCalled();
+    });
+
+    it("does not re-issue when host and port are unchanged on a ready access point", async () => {
+        mockClient.query.mockImplementation(accessStatusQueryHandler());
+
+        await _onStateChangeBackboneForTest(siteId, `accessstatus-${accessId}`, "hash-same", {
+            host: "old.example.com",
+            port: 9090,
+        });
+
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("Lifecycle = 'new'"),
+            expect.anything()
+        );
+        expect(DeleteSecret).not.toHaveBeenCalled();
+        expect(UpdateLocalState).not.toHaveBeenCalled();
     });
 });

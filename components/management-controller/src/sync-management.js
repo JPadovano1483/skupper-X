@@ -44,7 +44,7 @@ import { RegisterHandler } from "./backbone-links.js";
 import { HashOfSecret, HashOfData } from "./resource-templates.js";
 import { SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
-import { isRevoked } from "./tls-revoke.js";
+import { isRevoked, dropAccessPointCertificate, deleteKubeTlsObjectList } from "./tls-revoke.js";
 
 const peers = {}; // {peerId: {pClass: <>, stuff}}
 
@@ -255,44 +255,66 @@ async function onLostBackbone(_peerId) {
 }
 
 async function onStateChangeBackbone(peerId, stateKey, hash, data) {
-    //
-    // Notes:
-    //   This will update the access point with host/port on initial site creation.
-    //   If there is any subsequent change to the host/port configuration, this will not respond in any way.
-    //   TODO - Consider going back to partial state on deletion and re-issuing the TLS cert on update.
-    //     Delete => delete TLS certificate, nullify host/port, lifecycle := partial
-    //     Update => delete TLS certificate, update host/port, lifecycle := new
-    //
-    if (stateKey.substring(0, 13) == "accessstatus-") {
-        if (!hash) {
-            //
-            // No action needed on the deletion of host/port data which resulted from the deletion of the access point
-            //
+    if (stateKey.substring(0, 13) != "accessstatus-") {
+        Log(`Unexpected state-key ${stateKey} in onStateChangeBackbone`);
+        return;
+    }
+
+    const accessId = stateKey.substring(13);
+    const client = await ClientFromPool("system");
+    const notify = new NotifyTransaction();
+    let droppedObjectNames = [];
+    try {
+        await client.query("BEGIN");
+        const result = await client.query(
+            "SELECT Id, Lifecycle, Hostname, Port, Certificate FROM BackboneAccessPoints " +
+                "WHERE Id = $1 AND InteriorSite = $2",
+            [accessId, peerId]
+        );
+        if (result.rowCount != 1) {
+            await client.query("COMMIT");
             return;
         }
+        const accessPoint = result.rows[0];
 
-        const accessId = stateKey.substring(13);
-        const client = await ClientFromPool("system");
-        const notify = new NotifyTransaction();
-        try {
-            await client.query("BEGIN");
+        if (!hash) {
+            droppedObjectNames = await dropAccessPointCertificate(client, notify, accessId);
             await client.query(
-                "UPDATE BackboneAccessPoints SET Hostname = $1, Port = $2, Lifecycle = 'new' " +
-                    "WHERE Id = $3 AND Lifecycle = 'partial' AND InteriorSite = $4",
-                [data.host, data.port, accessId, peerId]
+                "UPDATE BackboneAccessPoints SET Hostname = NULL, Port = NULL, Certificate = NULL, Lifecycle = 'partial' " +
+                    "WHERE Id = $1",
+                [accessId]
             );
             notify.update("BackboneAccessPoints", accessId);
-            await client.query("COMMIT");
-            await notify.commit();
-        } catch (error) {
-            await client.query("ROLLBACK");
-            Log(`Exception in onStateChangeBackbone processing: ${error.message}`);
-            Log(error.stack);
-        } finally {
-            client.release();
+        } else {
+            const unchanged =
+                accessPoint.lifecycle != "partial" &&
+                accessPoint.hostname == data.host &&
+                String(accessPoint.port ?? "") === String(data.port ?? "");
+            if (!unchanged) {
+                droppedObjectNames = await dropAccessPointCertificate(client, notify, accessId);
+                await client.query(
+                    "UPDATE BackboneAccessPoints SET Hostname = $1, Port = $2, Certificate = NULL, Lifecycle = 'new' " +
+                        "WHERE Id = $3",
+                    [data.host, data.port, accessId]
+                );
+                notify.update("BackboneAccessPoints", accessId);
+            }
         }
-    } else {
-        Log(`Unexpected state-key ${stateKey} in onStateChangeBackbone`);
+
+        await client.query("COMMIT");
+        await notify.commit();
+    } catch (error) {
+        await client.query("ROLLBACK");
+        Log(`Exception in onStateChangeBackbone processing: ${error.message}`);
+        Log(error.stack);
+        droppedObjectNames = [];
+    } finally {
+        client.release();
+    }
+
+    await deleteKubeTlsObjectList(droppedObjectNames);
+    if (droppedObjectNames.length > 0) {
+        await UpdateLocalState(peerId, `tls-server-${accessId}`, null);
     }
 }
 
@@ -987,4 +1009,5 @@ export {
     onNewMember as _onNewMemberForTest,
     onLostMember as _onLostMemberForTest,
     getStateTlsMemberSite as _getStateTlsMemberSiteForTest,
+    onStateChangeBackbone as _onStateChangeBackboneForTest,
 };

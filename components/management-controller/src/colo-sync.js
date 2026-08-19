@@ -29,6 +29,7 @@ import { ClientFromPool } from "./db.js";
 import * as resourceTemplates from "./resource-templates.js";
 import * as common from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
+import { dropAccessPointCertificate, deleteKubeTlsObjectList } from "./tls-revoke.js";
 
 const coloNamespaces = {}; // {namespace-name: {backbone, site, accesspoint}}
 const backbonesWithNoNamespace = [];
@@ -408,6 +409,7 @@ async function doVisitNamespace(ns) {
         //
         // Ensure accesspoint has host/port attributes matching the RouterAccess CR (else set accesspoint host/port and status to NEW)
         //
+        let droppedApObjectNames = [];
         if (
             !!ap &&
             ap.status?.endpoints?.length == 1 &&
@@ -415,8 +417,13 @@ async function doVisitNamespace(ns) {
                 ap.status.endpoints[0].port != coloNamespaces[ns].accesspoint.port)
         ) {
             const ep = ap.status.endpoints[0];
+            droppedApObjectNames = await dropAccessPointCertificate(
+                client,
+                notify,
+                coloNamespaces[ns].accesspoint.id
+            );
             const result = await client.query(
-                "UPDATE BackboneAccessPoints SET hostname = $2, port = $3, lifecycle = $4 WHERE Id = $1 RETURNING *",
+                "UPDATE BackboneAccessPoints SET hostname = $2, port = $3, certificate = NULL, lifecycle = $4 WHERE Id = $1 RETURNING *",
                 [coloNamespaces[ns].accesspoint.id, ep.host, ep.port, "new"]
             );
             notify.update("BackboneAccessPoints", coloNamespaces[ns].accesspoint.id);
@@ -437,6 +444,7 @@ async function doVisitNamespace(ns) {
 
         await client.query("COMMIT");
         await notify.commit();
+        await deleteKubeTlsObjectList(droppedApObjectNames);
     } catch (error) {
         await client.query("ROLLBACK");
         if (undoSite) {

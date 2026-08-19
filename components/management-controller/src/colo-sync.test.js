@@ -34,6 +34,8 @@ vi.mock("@vms/modules/kube", () => ({
     ReplaceSecret: vi.fn(),
     GetSites: vi.fn(async () => []),
     LoadRouterAccess: vi.fn(),
+    DeleteSecret: vi.fn(),
+    DeleteCertificate: vi.fn(),
 }));
 
 vi.mock("./db.js", () => ({
@@ -63,6 +65,8 @@ import {
     ReplaceSecret,
     GetSites,
     LoadRouterAccess,
+    DeleteSecret,
+    DeleteCertificate,
 } from "@vms/modules/kube";
 
 const COLO_NS = "colo-ns-1";
@@ -312,5 +316,102 @@ describe("colo-sync TLS secret sync", () => {
 
         expect(ReplaceSecret).not.toHaveBeenCalled();
         expect(ApplyObject).not.toHaveBeenCalled();
+    });
+
+    it("drops the access-point TLS cert when the colo hostname changes", async () => {
+        DeleteSecret.mockResolvedValue({});
+        DeleteCertificate.mockResolvedValue({});
+        LoadRouterAccess.mockResolvedValue({
+            status: { endpoints: [{ host: "new.example.com", port: 5671 }] },
+        });
+        mockClient.query.mockImplementation(async (sql, params) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("FROM InteriorSites WHERE CoLocated = true AND Backbone")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: SITE_ID,
+                            name: "co-located",
+                            lifecycle: "ready",
+                            certificate: SITE_CERT_ID,
+                        },
+                    ],
+                };
+            }
+            if (
+                sql.includes("FROM BackboneAccessPoints WHERE InteriorSite") &&
+                sql.includes("manage")
+            ) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: AP_ID,
+                            lifecycle: "ready",
+                            certificate: AP_CERT_ID,
+                            hostname: "manage.example.com",
+                            port: 5671,
+                        },
+                    ],
+                };
+            }
+            if (sql.includes("FROM CertificateRequests WHERE AccessPoint")) {
+                return { rows: [] };
+            }
+            if (sql.includes("SELECT Certificate FROM BackboneAccessPoints")) {
+                return { rows: [{ certificate: AP_CERT_ID }] };
+            }
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM TlsCertificates WHERE Id")) {
+                const certId = params[0];
+                if (certId === SITE_CERT_ID) {
+                    return { rowCount: 1, rows: [{ objectname: MC_SITE_SECRET_NAME }] };
+                }
+                if (certId === AP_CERT_ID) {
+                    return { rowCount: 1, rows: [{ objectname: MC_AP_SECRET_NAME }] };
+                }
+            }
+            if (sql.includes("UPDATE BackboneAccessPoints SET Certificate = NULL")) {
+                return { rowCount: 1 };
+            }
+            if (sql.includes("DELETE FROM TlsCertificates")) {
+                return { rowCount: 1 };
+            }
+            if (sql.includes("UPDATE BackboneAccessPoints SET hostname")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: AP_ID,
+                            lifecycle: "new",
+                            certificate: null,
+                            hostname: "new.example.com",
+                            port: 5671,
+                        },
+                    ],
+                };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        await Start();
+        await triggerInitialReconcile();
+
+        expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
+            AP_CERT_ID,
+        ]);
+        expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("lifecycle = $4"), [
+            AP_ID,
+            "new.example.com",
+            5671,
+            "new",
+        ]);
+        expect(DeleteSecret).toHaveBeenCalledWith(MC_AP_SECRET_NAME);
+        expect(DeleteCertificate).toHaveBeenCalledWith(MC_AP_SECRET_NAME);
     });
 });

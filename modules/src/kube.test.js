@@ -18,7 +18,13 @@
 */
 
 import { describe, it, expect } from "vitest";
-import { Annotation, Controlled, Namespace, markCertificateForRenewal } from "./kube.js";
+import {
+    Annotation,
+    Controlled,
+    Namespace,
+    markCertificateForRenewal,
+    setCertificateDnsName,
+} from "./kube.js";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_STATE_ID } from "./common.js";
 
 describe("kube helpers", () => {
@@ -104,5 +110,28 @@ describe("kube helpers", () => {
             reason: "ManuallyTriggered",
         });
         expect(marked.status.conditions[0].observedGeneration).toBeUndefined();
+    });
+
+    it("setCertificateDnsName replaces dnsNames when the hostname changed", () => {
+        const updated = setCertificateDnsName(
+            {
+                metadata: { name: "vms-access-1" },
+                spec: { commonName: "vms-access-1", dnsNames: ["old.example.com"] },
+            },
+            "new.example.com"
+        );
+
+        expect(updated.spec.dnsNames).toEqual(["new.example.com"]);
+        expect(updated.spec.commonName).toBe("vms-access-1");
+    });
+
+    it("setCertificateDnsName returns null when dnsNames already match", () => {
+        expect(
+            setCertificateDnsName(
+                { spec: { dnsNames: ["router.example.com"] } },
+                "router.example.com"
+            )
+        ).toBeNull();
+        expect(setCertificateDnsName({ spec: {} }, null)).toBeNull();
     });
 });

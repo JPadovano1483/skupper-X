@@ -189,6 +189,34 @@ export async function TriggerCertificateRenewal(name) {
     });
 }
 
+export function setCertificateDnsName(cert, dnsName) {
+    if (!dnsName) {
+        return null;
+    }
+    const current = cert.spec?.dnsNames;
+    if (Array.isArray(current) && current.length === 1 && current[0] === dnsName) {
+        return null;
+    }
+    return {
+        ...cert,
+        spec: {
+            ...cert.spec,
+            dnsNames: [dnsName],
+        },
+    };
+}
+
+export async function ReplaceCertificate(obj) {
+    return await customApi.replaceNamespacedCustomObject({
+        group: "cert-manager.io",
+        version: "v1",
+        namespace: obj.metadata?.namespace || namespace,
+        plural: "certificates",
+        name: obj.metadata.name,
+        body: obj,
+    });
+}
+
 export async function DeleteCertificate(name) {
     await customApi.deleteNamespacedCustomObject({
         group: "cert-manager.io",

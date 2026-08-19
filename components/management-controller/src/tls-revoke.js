@@ -66,7 +66,7 @@ export async function listRevokedCertificateIds(client) {
     return result.rows.map((row) => row.certificateid);
 }
 
-async function deleteKubeTlsObjects(objectName) {
+export async function deleteKubeTlsObjects(objectName) {
     try {
         await DeleteSecret(objectName);
     } catch (error) {
@@ -77,6 +77,57 @@ async function deleteKubeTlsObjects(objectName) {
     } catch (error) {
         Log(`WARN: Failed to delete Certificate ${objectName}: ${error.message}`);
     }
+}
+
+export async function deleteKubeTlsObjectList(objectNames) {
+    const seen = new Set();
+    for (const name of objectNames) {
+        if (!name || seen.has(name)) {
+            continue;
+        }
+        seen.add(name);
+        await deleteKubeTlsObjects(name);
+    }
+}
+
+export async function dropAccessPointCertificate(client, notify, accessId) {
+    const objectNames = [];
+    const pending = await client.query(
+        "SELECT Id FROM CertificateRequests WHERE AccessPoint = $1",
+        [accessId]
+    );
+    for (const row of pending.rows) {
+        objectNames.push(`vms-access-${row.id}`);
+        await client.query("DELETE FROM CertificateRequests WHERE Id = $1", [row.id]);
+        notify.delete("CertificateRequests", row.id);
+    }
+
+    const apResult = await client.query(
+        "SELECT Certificate FROM BackboneAccessPoints WHERE Id = $1",
+        [accessId]
+    );
+    const certId = apResult.rows[0]?.certificate;
+    if (!certId) {
+        return objectNames;
+    }
+
+    const tlsResult = await client.query("SELECT ObjectName FROM TlsCertificates WHERE Id = $1", [
+        certId,
+    ]);
+    if (tlsResult.rowCount == 1 && tlsResult.rows[0].objectname) {
+        objectNames.push(tlsResult.rows[0].objectname);
+    }
+
+    await client.query("UPDATE BackboneAccessPoints SET Certificate = NULL WHERE Id = $1", [
+        accessId,
+    ]);
+
+    if (!(await isRevoked(client, certId))) {
+        await client.query("DELETE FROM TlsCertificates WHERE Id = $1", [certId]);
+        notify.delete("TlsCertificates", certId);
+    }
+
+    return objectNames;
 }
 
 export async function advertiseTlsRevoked(certId) {
