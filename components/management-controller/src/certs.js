@@ -1018,7 +1018,7 @@ export async function RotateCertificate(cid) {
     const client = await ClientFromPool("system");
     try {
         const result = await client.query(
-            "SELECT id, objectname, label, isca, expiration, renewaltime, generation FROM tlsCertificates WHERE id = $1",
+            "SELECT id, objectname, label, isca, expiration, renewaltime, rotationordinal FROM tlsCertificates WHERE id = $1",
             [cid]
         );
         if (result.rowCount == 0) {

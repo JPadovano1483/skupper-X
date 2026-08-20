@@ -251,7 +251,7 @@ const TLS = () => {
         { key: "label", header: "Label" },
         { key: "expiration", header: "Expiration" },
         { key: "renewaltime", header: "Renewal Time" },
-        { key: "generation", header: "Gen" },
+        { key: "rotationordinal", header: "Gen" },
         { key: "actions", header: "" },
     ];
 
@@ -294,7 +294,7 @@ const TLS = () => {
                             </Tag>
                         </TableCell>
                         <TableCell>{formatDate(cert.renewaltime)}</TableCell>
-                        <TableCell>{cert.generation}</TableCell>
+                        <TableCell>{cert.rotationordinal}</TableCell>
                         <TableCell>{renderCertActions(cert)}</TableCell>
                     </TableExpandRow>
                     {isExpanded && isLoadingChildren && (
@@ -337,7 +337,7 @@ const TLS = () => {
                         </Tag>
                     </TableCell>
                     <TableCell>{formatDate(cert.renewaltime)}</TableCell>
-                    <TableCell>{cert.generation}</TableCell>
+                    <TableCell>{cert.rotationordinal}</TableCell>
                     <TableCell>{renderCertActions(cert)}</TableCell>
                 </TableRow>
             );

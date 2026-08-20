@@ -139,7 +139,8 @@ CREATE TABLE TlsCertificates (
     SignedBy UUID REFERENCES TlsCertificates,  -- NULL => signed by the Root Issuer
     Expiration timestamptz,
     RenewalTime timestamptz,
-    Generation integer DEFAULT 0,
+    RotationOrdinal integer NOT NULL DEFAULT 0, -- this.RotationOrdinal = this.Supercedes.RotationOrdinal + 1
+    Supercedes UUID REFERENCES TlsCertificates, -- The TlsCertificate this row replaced; NULL for the original issue
     Label text
 );
 
