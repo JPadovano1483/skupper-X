@@ -70,9 +70,7 @@ export async function reconcileCertificates() {
     const client = await ClientFromPool("system");
     try {
         const result = await client.query("SELECT ObjectName FROM TlsCertificates");
-        const dbCertNames = new Set(
-            result.rows.map((row) => row.objectname).filter(Boolean)
-        );
+        const dbCertNames = new Set(result.rows.map((row) => row.objectname).filter(Boolean));
 
         for (const issuer of (await GetIssuers()) || []) {
             if (isVmsControlledOrphan(issuer, dbCertNames)) {

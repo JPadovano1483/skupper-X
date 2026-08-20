@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
     Breadcrumb,
     BreadcrumbItem,
@@ -17,8 +17,43 @@ import {
     Loading,
     OverflowMenu,
     OverflowMenuItem,
+    Modal,
+    Select,
+    SelectItem,
 } from "@carbon/react";
 import { Certificate, DocumentSigned } from "@carbon/icons-react";
+
+const CA_ROTATE_UNAVAILABLE = "CA certificate rotation is not supported";
+const CA_REVOKE_UNAVAILABLE = "CA certificate revocation is not supported";
+
+const certsUrl = ({ signedBy, expiresWithin } = {}) => {
+    const params = new URLSearchParams();
+    if (signedBy) {
+        params.set("signedby", signedBy);
+    }
+    if (expiresWithin) {
+        params.set("expiresWithin", String(expiresWithin));
+    }
+    const qs = params.toString();
+    return qs ? `/api/v1alpha1/certs?${qs}` : "/api/v1alpha1/certs";
+};
+
+const postCertAction = async (certId, action) => {
+    const response = await fetch(`/api/v1alpha1/certs/${certId}/${action}`, {
+        method: "POST",
+    });
+    if (!response.ok) {
+        const text = await response.text();
+        const error = new Error(text || `HTTP error! status: ${response.status}`);
+        error.status = response.status;
+        throw error;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+        return response.json();
+    }
+    return null;
+};
 
 const TLS = () => {
     const [certificates, setCertificates] = useState([]);
@@ -27,39 +62,53 @@ const TLS = () => {
     const [expandedRows, setExpandedRows] = useState({});
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [expiresWithin, setExpiresWithin] = useState("");
+    const [actionNotice, setActionNotice] = useState(null);
+    const [actionBusy, setActionBusy] = useState(false);
+    const [certToRevoke, setCertToRevoke] = useState(null);
+    const [revokeError, setRevokeError] = useState(null);
+
+    const fetchCertificates = useCallback(
+        async ({ showLoading = true } = {}) => {
+            try {
+                if (showLoading) {
+                    setLoading(true);
+                }
+                setError(null);
+                const response = await fetch(certsUrl({ expiresWithin }));
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                setCertificates(data);
+            } catch (err) {
+                setError(err.message);
+                console.error("Error fetching certificates:", err);
+            } finally {
+                if (showLoading) {
+                    setLoading(false);
+                }
+            }
+        },
+        [expiresWithin]
+    );
 
     useEffect(() => {
+        setExpandedRows({});
+        setChildCerts({});
         fetchCertificates();
-    }, []);
+    }, [fetchCertificates]);
 
-    const fetchCertificates = async () => {
-        try {
-            setLoading(true);
-            setError(null);
-            const response = await fetch("/api/v1alpha1/certs");
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-
-            const data = await response.json();
-            setCertificates(data);
-        } catch (err) {
-            setError(err.message);
-            console.error("Error fetching certificates:", err);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const fetchChildCertificates = async (issuerId) => {
-        if (childCerts[issuerId]) {
-            return; // Already fetched
+    const fetchChildCertificates = async (issuerId, { force = false } = {}) => {
+        if (!force && childCerts[issuerId]) {
+            return;
         }
 
         try {
             setLoadingChildren((prev) => ({ ...prev, [issuerId]: true }));
-            const response = await fetch(`/api/v1alpha1/certs?signedby=${issuerId}`);
+            const response = await fetch(certsUrl({ signedBy: issuerId, expiresWithin }));
 
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
@@ -72,6 +121,14 @@ const TLS = () => {
         } finally {
             setLoadingChildren((prev) => ({ ...prev, [issuerId]: false }));
         }
+    };
+
+    const refreshCertificates = async () => {
+        await fetchCertificates({ showLoading: false });
+        const issuerIds = Object.keys(childCerts);
+        await Promise.all(
+            issuerIds.map((issuerId) => fetchChildCertificates(issuerId, { force: true }))
+        );
     };
 
     const formatDate = (dateString) => {
@@ -113,15 +170,81 @@ const TLS = () => {
         );
     };
 
-    const handleRevokeAndRotate = (cert) => {
-        // TODO: Implement revoke and rotate functionality
-        console.log("Revoke and Rotate:", cert);
+    const handleRotate = async (cert) => {
+        if (cert.isca) {
+            return;
+        }
+        try {
+            setActionBusy(true);
+            setActionNotice(null);
+            await postCertAction(cert.id, "rotate");
+            setActionNotice({
+                kind: "success",
+                title: "Certificate rotation requested",
+                subtitle: cert.label || cert.id,
+            });
+            await refreshCertificates();
+        } catch (err) {
+            setActionNotice({
+                kind: "error",
+                title:
+                    err.status === 409 ? "Cannot rotate certificate" : "Error rotating certificate",
+                subtitle: err.message,
+            });
+        } finally {
+            setActionBusy(false);
+        }
     };
 
-    const handleRevoke = (cert) => {
-        // TODO: Implement revoke functionality
-        console.log("Revoke:", cert);
+    const openRevokeModal = (cert) => {
+        if (cert.isca) {
+            return;
+        }
+        setCertToRevoke(cert);
+        setRevokeError(null);
     };
+
+    const handleRevoke = async () => {
+        if (!certToRevoke || certToRevoke.isca) {
+            return;
+        }
+        try {
+            setActionBusy(true);
+            setRevokeError(null);
+            await postCertAction(certToRevoke.id, "revoke");
+            setActionNotice({
+                kind: "success",
+                title: "Certificate revoked",
+                subtitle: certToRevoke.label || certToRevoke.id,
+            });
+            setCertToRevoke(null);
+            await refreshCertificates();
+        } catch (err) {
+            setRevokeError(err.message);
+        } finally {
+            setActionBusy(false);
+        }
+    };
+
+    const renderCertActions = (cert) => (
+        <OverflowMenu size="sm" flipped>
+            <OverflowMenuItem
+                itemText="Rotate"
+                disabled={cert.isca || actionBusy}
+                requireTitle={cert.isca}
+                title={cert.isca ? CA_ROTATE_UNAVAILABLE : undefined}
+                onClick={() => handleRotate(cert)}
+            />
+            <OverflowMenuItem
+                itemText="Revoke"
+                isDelete
+                disabled={cert.isca || actionBusy}
+                requireTitle={cert.isca}
+                title={cert.isca ? CA_REVOKE_UNAVAILABLE : undefined}
+                onClick={() => openRevokeModal(cert)}
+            />
+        </OverflowMenu>
+    );
 
     const headers = [
         { key: "type", header: "Type" },
@@ -172,19 +295,7 @@ const TLS = () => {
                         </TableCell>
                         <TableCell>{formatDate(cert.renewaltime)}</TableCell>
                         <TableCell>{cert.generation}</TableCell>
-                        <TableCell>
-                            <OverflowMenu size="sm" flipped>
-                                <OverflowMenuItem
-                                    itemText="Revoke and Rotate"
-                                    onClick={() => handleRevokeAndRotate(cert)}
-                                />
-                                <OverflowMenuItem
-                                    itemText="Revoke"
-                                    isDelete
-                                    onClick={() => handleRevoke(cert)}
-                                />
-                            </OverflowMenu>
-                        </TableCell>
+                        <TableCell>{renderCertActions(cert)}</TableCell>
                     </TableExpandRow>
                     {isExpanded && isLoadingChildren && (
                         <TableExpandedRow colSpan={headers.length + 1}>
@@ -227,19 +338,7 @@ const TLS = () => {
                     </TableCell>
                     <TableCell>{formatDate(cert.renewaltime)}</TableCell>
                     <TableCell>{cert.generation}</TableCell>
-                    <TableCell>
-                        <OverflowMenu size="sm" flipped>
-                            <OverflowMenuItem
-                                itemText="Revoke and Rotate"
-                                onClick={() => handleRevokeAndRotate(cert)}
-                            />
-                            <OverflowMenuItem
-                                itemText="Revoke"
-                                isDelete
-                                onClick={() => handleRevoke(cert)}
-                            />
-                        </OverflowMenu>
-                    </TableCell>
+                    <TableCell>{renderCertActions(cert)}</TableCell>
                 </TableRow>
             );
         }
@@ -262,6 +361,20 @@ const TLS = () => {
                 </p>
             </div>
 
+            <div style={{ marginBottom: "1rem", maxWidth: "300px" }}>
+                <Select
+                    id="tls-expires-within"
+                    labelText="Expiration"
+                    value={expiresWithin}
+                    onChange={(e) => setExpiresWithin(e.target.value)}
+                >
+                    <SelectItem value="" text="All certificates" />
+                    <SelectItem value="7" text="Expiring within 7 days" />
+                    <SelectItem value="14" text="Expiring within 14 days" />
+                    <SelectItem value="30" text="Expiring within 30 days" />
+                </Select>
+            </div>
+
             {loading && <Loading description="Loading certificates..." withOverlay={false} />}
 
             {error && (
@@ -274,11 +387,25 @@ const TLS = () => {
                 />
             )}
 
+            {actionNotice && (
+                <InlineNotification
+                    kind={actionNotice.kind}
+                    title={actionNotice.title}
+                    subtitle={actionNotice.subtitle}
+                    onCloseButtonClick={() => setActionNotice(null)}
+                    style={{ marginBottom: "1rem" }}
+                />
+            )}
+
             {!loading && !error && certificates.length === 0 && (
                 <InlineNotification
                     kind="info"
                     title="No certificates found"
-                    subtitle="There are currently no certificates configured."
+                    subtitle={
+                        expiresWithin
+                            ? "No certificates expire within the selected window."
+                            : "There are currently no certificates configured."
+                    }
                     hideCloseButton
                     style={{ marginBottom: "1rem" }}
                 />
@@ -306,6 +433,36 @@ const TLS = () => {
                     </Table>
                 </TableContainer>
             )}
+
+            <Modal
+                open={Boolean(certToRevoke)}
+                danger
+                modalHeading="Revoke certificate"
+                primaryButtonText="Revoke"
+                secondaryButtonText="Cancel"
+                onRequestClose={() => {
+                    setCertToRevoke(null);
+                    setRevokeError(null);
+                }}
+                onRequestSubmit={handleRevoke}
+                primaryButtonDisabled={actionBusy || !certToRevoke || certToRevoke.isca}
+            >
+                {revokeError && (
+                    <InlineNotification
+                        kind="error"
+                        title="Cannot revoke certificate"
+                        subtitle={revokeError}
+                        onCloseButtonClick={() => setRevokeError(null)}
+                        style={{ marginBottom: "1rem" }}
+                    />
+                )}
+
+                <p>
+                    Are you sure you want to revoke{" "}
+                    <strong>{certToRevoke?.label || certToRevoke?.id}</strong>? This action cannot
+                    be undone.
+                </p>
+            </Modal>
         </div>
     );
 };
