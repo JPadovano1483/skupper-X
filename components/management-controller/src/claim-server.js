@@ -183,7 +183,9 @@ const processClaim = async function (claimId, name) {
         const result = await client.query(
             "SELECT MemberInvitations.*, TlsCertificates.Expiration AS certexpiration FROM MemberInvitations " +
                 "LEFT JOIN TlsCertificates ON TlsCertificates.Id = MemberInvitations.Certificate " +
-                "WHERE MemberInvitations.Id = $1 AND MemberInvitations.LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
+                "JOIN ApplicationNetworks ON ApplicationNetworks.Id = MemberInvitations.MemberOf " +
+                "WHERE MemberInvitations.Id = $1 AND MemberInvitations.LifeCycle != 'expired' " +
+                "AND ApplicationNetworks.LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
             [claimId]
         );
         if (result.rowCount != 1) {

@@ -394,7 +394,7 @@ export async function rotateCaKey(oldCaId, options = {}) {
         throw httpError(400, "CA has no issuer");
     }
     const signedBy = options.signedBy !== undefined ? options.signedBy : oldCert.signedby;
-    const issuerLink = options.issuerLink || (signedBy || "root");
+    const issuerLink = options.issuerLink || signedBy || "root";
     const newId = options.newId || randomUUID();
     const newObjectName = nextCaObjectName(oldCert.objectname, newId);
     const certObj = newCaCertificateObject(oldKubeCert, {

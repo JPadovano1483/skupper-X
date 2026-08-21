@@ -636,10 +636,85 @@ const evictMember = async function (req, res) {
     return returnStatus;
 };
 
+async function revokeLeafCertificates(certificates, reason) {
+    for (const certificate of certificates) {
+        if (!certificate) {
+            continue;
+        }
+        try {
+            await RevokeCertificate(certificate, { reason });
+        } catch (error) {
+            Log(`WARN: Failed to revoke cert ${certificate}: ${error.message}`);
+        }
+    }
+}
+
 const evictVan = async function (req, res) {
-    const _vid = req.params.vid;
-    const returnStatus = 501;
-    res.status(returnStatus).send("Network eviction not implemented");
+    const vid = req.params.vid;
+    let returnStatus = 200;
+    if (!IsValidUuid(vid)) {
+        res.status(400).send("VAN-Id is not a valid uuid");
+        return 400;
+    }
+
+    const client = await ClientFromPool();
+    const notify = new NotifyTransaction();
+    let invitations = [];
+    let members = [];
+    try {
+        await queryWithContext(req, client, async (client) => {
+            const vanResult = await client.query(
+                "UPDATE ApplicationNetworks SET Lifecycle = 'expired', Failure = 'Evicted via API' WHERE Id = $1 RETURNING Id",
+                [vid]
+            );
+            if (vanResult.rowCount != 1) {
+                returnStatus = 404;
+                throw new Error("Application network not found");
+            }
+            notify.update("ApplicationNetworks", vid);
+
+            const invResult = await client.query(
+                "UPDATE MemberInvitations SET Lifecycle = 'expired', Failure = 'VAN evicted via API' WHERE MemberOf = $1 RETURNING Id, Certificate",
+                [vid]
+            );
+            invitations = invResult.rows;
+            for (const row of invitations) {
+                notify.update("MemberInvitations", row.id);
+            }
+
+            const memberResult = await client.query(
+                "UPDATE MemberSites SET Lifecycle = 'expired', Failure = 'VAN evicted via API' WHERE MemberOf = $1 RETURNING Id, Certificate",
+                [vid]
+            );
+            members = memberResult.rows;
+            for (const row of members) {
+                notify.update("MemberSites", row.id);
+            }
+        });
+        await notify.commit();
+
+        // VAN CA stays; only invitation and member leaf certificates are revoked.
+        await revokeLeafCertificates(
+            invitations.map((row) => row.certificate),
+            "VAN evicted via API"
+        );
+        await revokeLeafCertificates(
+            members.map((row) => row.certificate),
+            "VAN evicted via API"
+        );
+        await PruneNow();
+        for (const row of members) {
+            await MemberEvicted(row.id);
+        }
+        res.status(returnStatus).end();
+    } catch (error) {
+        if (returnStatus === 200) {
+            returnStatus = 500;
+        }
+        res.status(returnStatus).send(error.message);
+    } finally {
+        client.release();
+    }
     return returnStatus;
 };
 

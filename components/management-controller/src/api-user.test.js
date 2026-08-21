@@ -434,6 +434,156 @@ describe("api-user", () => {
         expect(PruneNow).not.toHaveBeenCalled();
     });
 
+    it("PUT /vans/:vid/evict expires the VAN, invitations, and members without revoking the VAN CA", async () => {
+        const invitationCert = "00000000-0000-4000-8000-000000000015";
+        const memberCert = "00000000-0000-4000-8000-000000000016";
+        const vanCa = "00000000-0000-4000-8000-000000000017";
+        const memberTwo = "00000000-0000-4000-8000-000000000018";
+        const queries = [];
+        mockClient.query.mockImplementation(async (sql, params) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            queries.push({ sql, params });
+            if (sql.includes("UPDATE ApplicationNetworks SET Lifecycle = 'expired'")) {
+                return { rowCount: 1, rows: [{ id: TEST_UUIDS.van, certificate: vanCa }] };
+            }
+            if (sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")) {
+                return {
+                    rowCount: 1,
+                    rows: [{ id: TEST_UUIDS.invitation, certificate: invitationCert }],
+                };
+            }
+            if (sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")) {
+                return {
+                    rowCount: 2,
+                    rows: [
+                        { id: TEST_UUIDS.member, certificate: memberCert },
+                        { id: memberTwo, certificate: null },
+                    ],
+                };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/vans/${TEST_UUIDS.van}/evict`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(200);
+        expect(
+            queries.some((query) =>
+                query.sql.includes("UPDATE ApplicationNetworks SET Lifecycle = 'expired'")
+            )
+        ).toBe(true);
+        expect(
+            queries.some((query) =>
+                query.sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")
+            )
+        ).toBe(true);
+        expect(
+            queries.some((query) =>
+                query.sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")
+            )
+        ).toBe(true);
+        expect(RevokeCertificate).toHaveBeenCalledWith(invitationCert, {
+            reason: "VAN evicted via API",
+        });
+        expect(RevokeCertificate).toHaveBeenCalledWith(memberCert, {
+            reason: "VAN evicted via API",
+        });
+        expect(RevokeCertificate).not.toHaveBeenCalledWith(vanCa, expect.anything());
+        expect(RevokeCertificate).toHaveBeenCalledTimes(2);
+        expect(PruneNow).toHaveBeenCalled();
+        expect(MemberEvicted).toHaveBeenCalledWith(TEST_UUIDS.member);
+        expect(MemberEvicted).toHaveBeenCalledWith(memberTwo);
+    });
+
+    it("PUT /vans/:vid/evict expires a VAN with no members or invitations", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("UPDATE ApplicationNetworks SET Lifecycle = 'expired'")) {
+                return { rowCount: 1, rows: [{ id: TEST_UUIDS.van }] };
+            }
+            if (sql.includes("UPDATE MemberInvitations SET Lifecycle = 'expired'")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("UPDATE MemberSites SET Lifecycle = 'expired'")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/vans/${TEST_UUIDS.van}/evict`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(200);
+        expect(RevokeCertificate).not.toHaveBeenCalled();
+        expect(MemberEvicted).not.toHaveBeenCalled();
+        expect(PruneNow).toHaveBeenCalled();
+    });
+
+    it("PUT /vans/:vid/evict returns 404 when the VAN is missing", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("UPDATE ApplicationNetworks SET Lifecycle = 'expired'")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put(`/api/v1alpha1/vans/${TEST_UUIDS.van}/evict`)
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(404);
+        expect(RevokeCertificate).not.toHaveBeenCalled();
+        expect(PruneNow).not.toHaveBeenCalled();
+        expect(MemberEvicted).not.toHaveBeenCalled();
+    });
+
+    it("PUT /vans/:vid/evict returns 400 for an invalid VAN id", async () => {
+        const { app } = await buildApiApp({ includeAdmin: false });
+
+        const res = await request(app)
+            .put("/api/v1alpha1/vans/not-a-uuid/evict")
+            .set("x-test-auth", "1");
+
+        expect(res.status).toBe(400);
+        expect(RevokeCertificate).not.toHaveBeenCalled();
+        expect(PruneNow).not.toHaveBeenCalled();
+        expect(MemberEvicted).not.toHaveBeenCalled();
+    });
+
     it("DELETE /invitations/:iid prunes after deleting the invitation", async () => {
         mockClient.query.mockImplementation(async (sql) => {
             if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {

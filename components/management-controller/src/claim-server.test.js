@@ -140,7 +140,22 @@ describe("_processClaimForTest", () => {
         const [statusCode, statusDescription] = await _processClaimForTest("inv-expired", "site-a");
 
         expect(getInvitationSql()).toContain("LifeCycle != 'expired'");
+        expect(getInvitationSql()).toContain("ApplicationNetworks.LifeCycle != 'expired'");
         expect(getInvitationSql()).toContain("LEFT JOIN TlsCertificates");
+        expect(statusCode).toBe(400);
+        expect(statusDescription).toContain("No valid invitation exists for the claim");
+    });
+
+    it("rejects claims when the application network is expired", async () => {
+        const getInvitationSql = mockInvitationQuery([]);
+
+        const [statusCode, statusDescription] = await _processClaimForTest(
+            "inv-van-expired",
+            "site-a"
+        );
+
+        expect(getInvitationSql()).toContain("JOIN ApplicationNetworks");
+        expect(getInvitationSql()).toContain("ApplicationNetworks.LifeCycle != 'expired'");
         expect(statusCode).toBe(400);
         expect(statusDescription).toContain("No valid invitation exists for the claim");
     });
