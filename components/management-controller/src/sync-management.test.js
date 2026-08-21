@@ -68,6 +68,7 @@ import {
 } from "./sync-management.js";
 import { DeletePeer, UpdateLocalState } from "@vms/modules/state-sync";
 import { LoadSecret, DeleteSecret, DeleteCertificate } from "@vms/modules/kube";
+import { HashOfSecret } from "./resource-templates.js";
 
 describe("GetBackboneLinks_TX", () => {
     it("returns links keyed by id with hostname", async () => {
@@ -427,6 +428,39 @@ describe("getStateTlsMemberSite", () => {
         expect(data).toEqual({ "tls.crt": Buffer.from("member-cert").toString("base64") });
     });
 
+    it("includes ordinal and lastValid in the TLS sync payload", async () => {
+        const inner = memberTlsQueryHandler({ lifecycle: "active" });
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("WHERE ObjectName = $1")) {
+                return {
+                    rowCount: 2,
+                    rows: [
+                        {
+                            rotationordinal: 0,
+                            expiration: new Date("2099-01-01T00:00:00.000Z"),
+                        },
+                        {
+                            rotationordinal: 1,
+                            expiration: new Date("2099-06-01T00:00:00.000Z"),
+                        },
+                    ],
+                };
+            }
+            return inner(sql);
+        });
+
+        const [hash, data] = await _getStateTlsMemberSiteForTest("member-1");
+        const cert = Buffer.from("member-cert").toString("base64");
+
+        expect(data).toEqual({
+            "tls.crt": cert,
+            ordinal: "1",
+            lastValid: "0",
+        });
+        expect(hash).toMatch(/^[a-f0-9]{40}$/);
+        expect(hash).not.toBe(HashOfSecret({ data: { "tls.crt": cert } }));
+    });
+
     it("returns a null hash for an expired member without loading the secret", async () => {
         mockClient.query.mockImplementation(memberTlsQueryHandler({ lifecycle: "expired" }));
 
@@ -613,7 +647,13 @@ function accessStatusQueryHandler({
         if (sql.includes("FROM TlsCertificates WHERE Id")) {
             return {
                 rowCount: objectname ? 1 : 0,
-                rows: objectname ? [{ objectname }] : [],
+                rows: objectname ? [{ id: certificate, objectname }] : [],
+            };
+        }
+        if (sql.includes("FROM TlsCertificates WHERE ObjectName")) {
+            return {
+                rowCount: objectname && certificate ? 1 : 0,
+                rows: objectname && certificate ? [{ id: certificate }] : [],
             };
         }
         if (sql.includes("FROM TlsClientRevocations")) {

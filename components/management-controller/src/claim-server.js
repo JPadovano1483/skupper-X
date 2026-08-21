@@ -29,6 +29,8 @@ import {
     META_ANNOTATION_STATE_HASH,
     META_ANNOTATION_STATE_DIR,
     META_ANNOTATION_TLS_INJECT,
+    META_ANNOTATION_TLS_ORDINAL,
+    META_ANNOTATION_TLS_LAST_VALID,
     INJECT_TYPE_SITE,
     META_ANNOTATION_STATE_TYPE,
     STATE_TYPE_LINK,
@@ -40,9 +42,10 @@ import { ClientFromPool } from "./db.js";
 import { LoadSecret } from "@vms/modules/kube";
 import { DispatchMessage, AssertClaimResponseSuccess, ReponseFailure } from "@vms/modules/protocol";
 import { RegisterHandler } from "./backbone-links.js";
-import { HashOfData } from "./resource-templates.js";
+import { HashOfData, HashOfSecret } from "./resource-templates.js";
 import { NotifyTransaction } from "./notify.js";
 import { isRevoked } from "./tls-revoke.js";
+import { getTlsRotationMeta } from "./tls-rotation.js";
 
 const backbones = {}; // backboneId => {conn: AMQP-Connection, sender: anon-sender, receiver: claim-receiver}
 const memberCompletions = {}; // memberId   => {handler: completion-function, result: undefined || {}, error: undefined || ERROR }
@@ -76,6 +79,7 @@ const memberCompletion = async function (memberId) {
         // Get the member site's siteClient certificate
         //
         const secret = await LoadSecret(memberSite.objectname);
+        const tlsMeta = await getTlsRotationMeta(client, memberSite.objectname);
         siteClient = {
             apiVersion: "v1",
             kind: "Secret",
@@ -84,12 +88,18 @@ const memberCompletion = async function (memberId) {
                 name: `vms-site-${memberId}`,
                 annotations: {
                     [META_ANNOTATION_STATE_KEY]: `tls-site-${memberId}`,
-                    [META_ANNOTATION_STATE_HASH]: HashOfData(secret.data),
                     [META_ANNOTATION_STATE_DIR]: "remote",
                     [META_ANNOTATION_TLS_INJECT]: INJECT_TYPE_SITE,
                 },
             },
         };
+        if (tlsMeta) {
+            siteClient.metadata.annotations[META_ANNOTATION_TLS_ORDINAL] = String(tlsMeta.ordinal);
+            siteClient.metadata.annotations[META_ANNOTATION_TLS_LAST_VALID] = String(
+                tlsMeta.lastValid
+            );
+        }
+        siteClient.metadata.annotations[META_ANNOTATION_STATE_HASH] = HashOfSecret(siteClient);
 
         //
         // Gather the edge-link information for the outgoingLinks

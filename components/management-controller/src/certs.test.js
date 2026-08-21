@@ -34,8 +34,10 @@ const notifyEvents = [];
 vi.mock("@vms/modules/kube", () => ({
     ApplyObject: vi.fn(),
     LoadCertificate: vi.fn(),
+    LoadSecret: vi.fn(),
     TriggerCertificateRenewal: vi.fn(),
     ReplaceCertificate: vi.fn(),
+    ReplaceSecret: vi.fn(),
     setCertificateDnsName: vi.fn((cert, dnsName) => {
         if (!dnsName) {
             return null;
@@ -126,8 +128,10 @@ import { RegisterNotification } from "./notify.js";
 import {
     ApplyObject,
     LoadCertificate,
+    LoadSecret,
     TriggerCertificateRenewal,
     ReplaceCertificate,
+    ReplaceSecret,
     setCertificateDnsName,
 } from "@vms/modules/kube";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
@@ -639,6 +643,17 @@ describe("onInteriorSitesChange", () => {
 });
 
 describe("onSecretWatch", () => {
+    const oldCert = {
+        id: "cert-1",
+        isca: false,
+        objectname: "vms-interior-cert-1",
+        signedby: "ca-1",
+        expiration: new Date("2026-09-01T12:00:00.000Z"),
+        renewaltime: new Date("2026-08-01T12:00:00.000Z"),
+        rotationordinal: 0,
+        label: "Backbone Site: site-a",
+    };
+
     beforeEach(async () => {
         vi.clearAllMocks();
         mockClient.query.mockReset();
@@ -647,11 +662,36 @@ describe("onSecretWatch", () => {
         for (const key of Object.keys(notificationHandlers)) {
             delete notificationHandlers[key];
         }
+        LoadSecret.mockResolvedValue({
+            metadata: {
+                name: "vms-interior-cert-1",
+                annotations: { "skupper.io/vms-dblink": "cert-1" },
+            },
+            data: { "tls.crt": "base64-cert" },
+        });
         await Start();
     });
 
-    it("propagates secret MODIFIED renewals for managed certs", async () => {
+    function modifiedSecret(resourceVersion) {
+        return {
+            metadata: {
+                name: "vms-interior-cert-1",
+                resourceVersion,
+                annotations: {
+                    "skupper.io/vms-controlled": "true",
+                    "skupper.io/vms-dblink": "cert-1",
+                },
+            },
+            data: {
+                "tls.crt": "base64-cert",
+            },
+        };
+    }
+
+    it("inserts a superseding TlsCertificates row on renew", async () => {
         LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-interior-cert-1", annotations: {} },
+            spec: { secretTemplate: { annotations: {} } },
             status: {
                 notAfter: "2026-10-12T12:00:00.000Z",
                 renewalTime: "2026-10-11T12:00:00.000Z",
@@ -661,33 +701,96 @@ describe("onSecretWatch", () => {
             if (transactionSql(sql)) {
                 return {};
             }
-            if (sql.includes("SELECT Id FROM TlsCertificates WHERE Id = $1 AND ObjectName = $2")) {
-                return { rowCount: 1, rows: [{ id: "cert-1" }] };
+            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+                return { rowCount: 1, rows: [oldCert] };
             }
-            if (sql.includes("UPDATE TlsCertificates SET Expiration = $1, RenewalTime = $2")) {
-                return {};
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("INSERT INTO TlsCertificates")) {
+                return { rows: [{ id: "cert-2" }] };
+            }
+            if (sql.includes("SET Certificate = $1 WHERE Certificate = $2")) {
+                return { rows: sql.includes("InteriorSites") ? [{ id: "site-1" }] : [] };
             }
             return { rowCount: 0, rows: [] };
         });
 
-        secretWatchHandler("MODIFIED", {
-            metadata: {
-                name: "vms-interior-cert-1",
-                resourceVersion: "42",
-                annotations: {
-                    "skupper.io/vms-controlled": "true",
-                    "skupper.io/vms-dblink": "cert-1",
-                },
-            },
-            data: {
-                "tls.crt": "base64-cert",
-            },
-        });
+        secretWatchHandler("MODIFIED", modifiedSecret("100"));
 
         await vi.waitFor(() => {
-            expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-1");
-            expect(AccessCertificateChanged).toHaveBeenCalledWith("cert-1");
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-2");
+            expect(AccessCertificateChanged).toHaveBeenCalledWith("cert-2");
         });
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("INSERT INTO TlsCertificates"),
+            expect.arrayContaining([
+                oldCert.isca,
+                oldCert.objectname,
+                oldCert.signedby,
+                expect.any(Date),
+                expect.any(Date),
+                1,
+                oldCert.id,
+                oldCert.label,
+            ])
+        );
+        expect(ReplaceCertificate).toHaveBeenCalled();
+        expect(ReplaceSecret).toHaveBeenCalledWith(
+            "vms-interior-cert-1",
+            expect.objectContaining({
+                metadata: expect.objectContaining({
+                    annotations: expect.objectContaining({
+                        "skupper.io/vms-dblink": "cert-2",
+                    }),
+                }),
+            })
+        );
+        expect(notifyEvents).toContainEqual({
+            method: "add",
+            table: "TlsCertificates",
+            id: "cert-2",
+        });
+        expect(notifyEvents).toContainEqual({
+            method: "update",
+            table: "InteriorSites",
+            id: "site-1",
+        });
+    });
+
+    it("does not insert a new row when expiration is unchanged", async () => {
+        LoadCertificate.mockResolvedValue({
+            status: {
+                notAfter: oldCert.expiration.toISOString(),
+                renewalTime: oldCert.renewaltime.toISOString(),
+            },
+        });
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+                return { rowCount: 1, rows: [oldCert] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        secretWatchHandler("MODIFIED", modifiedSecret("101"));
+
+        await vi.waitFor(() => {
+            expect(mockClient.query).toHaveBeenCalledWith(
+                expect.stringContaining("SELECT Id, IsCA, ObjectName"),
+                ["cert-1", "vms-interior-cert-1"]
+            );
+        });
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("INSERT INTO TlsCertificates"),
+            expect.anything()
+        );
+        expect(SiteCertificateChanged).not.toHaveBeenCalled();
     });
 });
 
@@ -711,6 +814,9 @@ describe("RotateCertificate", () => {
                 return { rowCount: 0, rows: [] };
             }
             if (sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
                 return { rowCount: 0, rows: [] };
             }
             return { rowCount: 1, rows: [certRow] };
@@ -767,6 +873,9 @@ describe("RotateCertificate", () => {
             if (sql.includes("FROM TlsClientRevocations")) {
                 return { rowCount: 0, rows: [] };
             }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
             return { rowCount: 1, rows: [{ ...certRow, objectname: null }] };
         });
 
@@ -792,6 +901,24 @@ describe("RotateCertificate", () => {
         expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
     });
 
+    it("refuses rotation of a superseded certificate", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 1, rows: [{ id: "cert-next" }] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 409,
+            message: "Certificate has been superseded",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
     it("maps a missing Certificate CR to 404", async () => {
         const missing = new Error("not found");
         missing.statusCode = 404;
@@ -810,6 +937,9 @@ describe("RotateCertificate", () => {
             }
             if (sql.includes("FROM BackboneAccessPoints")) {
                 return { rowCount: 1, rows: [{ hostname: "new.example.com" }] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
             }
             return { rowCount: 1, rows: [certRow] };
         });
@@ -843,6 +973,9 @@ describe("RotateCertificate", () => {
             }
             if (sql.includes("FROM BackboneAccessPoints")) {
                 return { rowCount: 1, rows: [{ hostname: "router.example.com" }] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
             }
             return { rowCount: 1, rows: [certRow] };
         });

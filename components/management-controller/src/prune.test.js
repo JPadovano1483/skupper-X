@@ -44,6 +44,11 @@ vi.mock("@vms/modules/kube", () => ({
     DeleteSecret: vi.fn(),
 }));
 
+vi.mock("./sync-management.js", () => ({
+    SiteCertificateChanged: vi.fn(async () => {}),
+    AccessCertificateChanged: vi.fn(async () => {}),
+}));
+
 import {
     DeleteOrphanCertificates,
     PruneNow,
@@ -59,6 +64,7 @@ import {
     DeleteSecret,
 } from "@vms/modules/kube";
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
+import { AccessCertificateChanged, SiteCertificateChanged } from "./sync-management.js";
 
 function kubeObj(name, controlled = true) {
     return {
@@ -76,8 +82,8 @@ describe("DeleteOrphanCertificates", () => {
             if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
                 return {};
             }
-            if (sql.includes("SELECT Id, SignedBy FROM TlsCertificates")) {
-                return { rows: [{ id: "orphan-cert", signedby: null }] };
+            if (sql.includes("SELECT Id, SignedBy, Supercedes FROM TlsCertificates")) {
+                return { rows: [{ id: "orphan-cert", signedby: null, supercedes: null }] };
             }
             if (sql.includes("SELECT Id, Certificate FROM")) {
                 return { rows: [] };
@@ -109,8 +115,8 @@ describe("DeleteOrphanCertificates", () => {
             if (sql.includes("DELETE FROM TlsClientRevocations")) {
                 return { rowCount: 0 };
             }
-            if (sql.includes("SELECT Id, SignedBy FROM TlsCertificates")) {
-                return { rows: [{ id: "revoked-cert", signedby: null }] };
+            if (sql.includes("SELECT Id, SignedBy, Supercedes FROM TlsCertificates")) {
+                return { rows: [{ id: "revoked-cert", signedby: null, supercedes: null }] };
             }
             if (sql.includes("SELECT CertificateId FROM TlsClientRevocations")) {
                 return { rows: [{ certificateid: "revoked-cert" }] };
@@ -130,6 +136,75 @@ describe("DeleteOrphanCertificates", () => {
             "DELETE FROM TlsCertificates WHERE Id = $1",
             ["revoked-cert"]
         );
+    });
+
+    it("keeps unexpired superseded certificates that are still referenced by Supercedes", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("SELECT Id, SignedBy, Supercedes FROM TlsCertificates")) {
+                return {
+                    rows: [
+                        { id: "old-cert", signedby: null, supercedes: null },
+                        { id: "new-cert", signedby: null, supercedes: "old-cert" },
+                    ],
+                };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM InteriorSites")) {
+                return { rows: [{ id: "site-1", certificate: "new-cert" }] };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM")) {
+                return { rows: [] };
+            }
+            if (sql.startsWith("DELETE FROM TlsCertificates")) {
+                return { rowCount: 1 };
+            }
+            return { rows: [] };
+        });
+
+        await DeleteOrphanCertificates();
+
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            "DELETE FROM TlsCertificates WHERE Id = $1",
+            ["old-cert"]
+        );
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            "DELETE FROM TlsCertificates WHERE Id = $1",
+            ["new-cert"]
+        );
+    });
+
+    it("deletes expired superseded rows and returns their object names", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("SELECT c.Id, c.ObjectName")) {
+                return { rows: [{ id: "old-cert", objectname: "vms-site-1" }] };
+            }
+            if (sql.includes("SELECT Id, SignedBy, Supercedes FROM TlsCertificates")) {
+                return { rows: [{ id: "new-cert", signedby: null, supercedes: null }] };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM InteriorSites")) {
+                return { rows: [{ id: "site-1", certificate: "new-cert" }] };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM")) {
+                return { rows: [] };
+            }
+            return { rows: [] };
+        });
+
+        const objectNames = await DeleteOrphanCertificates();
+
+        expect(objectNames).toEqual(["vms-site-1"]);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "UPDATE TlsCertificates SET Supercedes = NULL WHERE Supercedes = $1",
+            ["old-cert"]
+        );
+        expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
+            "old-cert",
+        ]);
     });
 });
 
@@ -213,7 +288,7 @@ describe("PruneNow", () => {
             if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
                 return {};
             }
-            if (sql.includes("SELECT Id, SignedBy FROM TlsCertificates")) {
+            if (sql.includes("SELECT Id, SignedBy, Supercedes FROM TlsCertificates")) {
                 return { rows: [] };
             }
             if (sql.includes("SELECT Id, Certificate FROM")) {
@@ -238,5 +313,34 @@ describe("PruneNow", () => {
         expect(GetIssuers).toHaveBeenCalled();
         expect(GetCertificates).toHaveBeenCalled();
         expect(GetSecrets).toHaveBeenCalled();
+    });
+
+    it("re-advertises TLS hashes after expired superseded rows are pruned", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("SELECT c.Id, c.ObjectName")) {
+                return { rows: [{ id: "old-cert", objectname: "vms-site-1" }] };
+            }
+            if (sql.includes("ORDER BY RotationOrdinal DESC")) {
+                return { rows: [{ id: "new-cert" }] };
+            }
+            if (sql.includes("SELECT Id, SignedBy, Supercedes FROM TlsCertificates")) {
+                return { rows: [{ id: "new-cert", signedby: null, supercedes: null }] };
+            }
+            if (sql.includes("SELECT Id, Certificate FROM")) {
+                return { rows: [{ id: "site-1", certificate: "new-cert" }] };
+            }
+            if (sql.includes("SELECT ObjectName FROM TlsCertificates")) {
+                return { rows: [{ objectname: "vms-site-1" }] };
+            }
+            return { rows: [] };
+        });
+
+        await PruneNow();
+
+        expect(SiteCertificateChanged).toHaveBeenCalledWith("new-cert");
+        expect(AccessCertificateChanged).toHaveBeenCalledWith("new-cert");
     });
 });

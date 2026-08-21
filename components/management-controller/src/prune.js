@@ -36,6 +36,8 @@ import {
     deleteKubeTlsObjectList,
     listRevokedCertificateIds,
 } from "./tls-revoke.js";
+import { deleteExpiredSupersededCertificates, getCurrentCertificateId } from "./tls-rotation.js";
+import { AccessCertificateChanged, SiteCertificateChanged } from "./sync-management.js";
 
 function uniqueObjectNames(objectNames) {
     const names = [];
@@ -122,8 +124,14 @@ export async function DeleteOrphanCertificates() {
     try {
         await client.query("BEGIN");
         await deleteExpiredRevocations(client);
+        const expiredObjectNames = await deleteExpiredSupersededCertificates(client, notify);
         const deleteMap = {};
-        const tlsResult = await client.query("SELECT Id, SignedBy FROM TlsCertificates");
+        const tlsResult = await client.query(
+            "SELECT Id, SignedBy, Supercedes FROM TlsCertificates"
+        );
+        const referencedAsPredecessor = new Set(
+            tlsResult.rows.map((row) => row.supercedes).filter(Boolean)
+        );
         for (const tlsRow of tlsResult.rows) {
             if (tlsRow.signedby) {
                 if (!deleteMap[tlsRow.signedby]) {
@@ -167,7 +175,13 @@ export async function DeleteOrphanCertificates() {
         }
 
         // Revoked certificates stay until their revocation Expiration is purged above.
+        // Superseded predecessors stay until deleteExpiredSupersededCertificates removes them.
         for (const certId of await listRevokedCertificateIds(client)) {
+            if (deleteMap[certId]) {
+                deleteMap[certId].pleaseDelete = false;
+            }
+        }
+        for (const certId of referencedAsPredecessor) {
             if (deleteMap[certId]) {
                 deleteMap[certId].pleaseDelete = false;
             }
@@ -192,6 +206,7 @@ export async function DeleteOrphanCertificates() {
 
         await client.query("COMMIT");
         await notify.commit();
+        return expiredObjectNames;
     } catch (error) {
         await client.query("ROLLBACK");
         Log(`Exception in DeleteOrphanCertificates: ${error.message}`);
@@ -201,11 +216,31 @@ export async function DeleteOrphanCertificates() {
     }
 }
 
+async function advertiseTlsLastValid(objectNames) {
+    const names = uniqueObjectNames(objectNames);
+    if (names.length == 0) {
+        return;
+    }
+    const client = await ClientFromPool("system");
+    try {
+        for (const objectName of names) {
+            const certId = await getCurrentCertificateId(client, objectName);
+            if (certId) {
+                await SiteCertificateChanged(certId);
+                await AccessCertificateChanged(certId);
+            }
+        }
+    } finally {
+        client.release();
+    }
+}
+
 export async function PruneNow() {
     try {
         Log("[Prune - Reconciling Kubernetes objects to the database]");
-        await DeleteOrphanCertificates();
+        const expiredObjectNames = await DeleteOrphanCertificates();
         await reconcileCertificates();
+        await advertiseTlsLastValid(expiredObjectNames);
     } catch (error) {
         Log(`Exception in PruneNow: ${error.stack}`);
     }

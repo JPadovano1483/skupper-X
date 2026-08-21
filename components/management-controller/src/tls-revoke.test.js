@@ -263,7 +263,7 @@ describe("dropAccessPointCertificate", () => {
                 return { rows: [{ certificate: CERT_ID }] };
             }
             if (sql.includes("FROM TlsCertificates")) {
-                return { rowCount: 1, rows: [{ objectname: "vms-access-req-1" }] };
+                return { rowCount: 1, rows: [{ id: CERT_ID, objectname: "vms-access-req-1" }] };
             }
             if (sql.includes("FROM TlsClientRevocations")) {
                 return { rowCount: 0, rows: [] };
@@ -277,6 +277,10 @@ describe("dropAccessPointCertificate", () => {
         expect(mockClient.query).toHaveBeenCalledWith(
             "UPDATE BackboneAccessPoints SET Certificate = NULL WHERE Id = $1",
             ["ap-1"]
+        );
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "UPDATE TlsCertificates SET Supercedes = NULL WHERE ObjectName = $1",
+            ["vms-access-req-1"]
         );
         expect(mockClient.query).toHaveBeenCalledWith("DELETE FROM TlsCertificates WHERE Id = $1", [
             CERT_ID,
@@ -294,7 +298,7 @@ describe("dropAccessPointCertificate", () => {
                 return { rows: [{ certificate: CERT_ID }] };
             }
             if (sql.includes("FROM TlsCertificates")) {
-                return { rowCount: 1, rows: [{ objectname: "vms-access-issued" }] };
+                return { rowCount: 1, rows: [{ id: CERT_ID, objectname: "vms-access-issued" }] };
             }
             if (sql.includes("FROM TlsClientRevocations")) {
                 return { rowCount: 1, rows: [{}] };

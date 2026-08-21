@@ -36,6 +36,7 @@ import { LoadSecret } from "@vms/modules/kube";
 import { RotateCertificate } from "./certs.js";
 import { RevokeCertificate } from "./tls-revoke.js";
 import { PruneNow } from "./prune.js";
+import { getTlsRotationMeta } from "./tls-rotation.js";
 import { Log } from "@vms/modules/log";
 import * as sync from "./sync-management.js";
 import * as adminApi from "./api-admin.js";
@@ -148,6 +149,7 @@ const fetchBackboneSiteSkupper2 = async function (req, res) {
                 throw new Error("Not permitted, site not ready for deployment");
             }
             const secret = await LoadSecret(site.objectname);
+            const siteTlsMeta = await getTlsRotationMeta(client, site.objectname);
             const output = [];
             output.push(resourceTemplates.ServiceAccount());
             output.push(resourceTemplates.BackboneRole());
@@ -158,7 +160,8 @@ const fetchBackboneSiteSkupper2 = async function (req, res) {
                     secret,
                     `vms-site-${siteId}`,
                     common.INJECT_TYPE_SITE,
-                    `tls-site-${siteId}`
+                    `tls-site-${siteId}`,
+                    siteTlsMeta
                 )
             );
 
@@ -226,12 +229,14 @@ const fetchBackboneAccessPointsKube = async function (req, res) {
                     );
                 }
                 const secret = await LoadSecret(ap.objectname);
+                const apTlsMeta = await getTlsRotationMeta(client, ap.objectname);
                 output.push(
                     resourceTemplates.Secret(
                         secret,
                         `vms-access-${ap.apid}`,
                         common.INJECT_TYPE_ACCESS_POINT,
-                        `tls-server-${ap.apid}`
+                        `tls-server-${ap.apid}`,
+                        apTlsMeta
                     )
                 );
             }
@@ -296,10 +301,11 @@ const getVanConfigConnecting = async function (req, res) {
             const van = result.rows[0];
             const ap = apResult.rows[0];
             const secret = await LoadSecret(van.objectname);
+            const vanTlsMeta = await getTlsRotationMeta(client, van.objectname);
             const output = [
                 resourceTemplates.NetworkCR(van.vanid),
                 resourceTemplates.NetworkLinkCR(ap.hostname, ap.port, van.objectname),
-                resourceTemplates.Secret(secret, van.objectname),
+                resourceTemplates.Secret(secret, van.objectname, undefined, undefined, vanTlsMeta),
             ];
             if (exposeNetworkObserverConsole) {
                 const routingKey = `skupper-console-${van.vanid}`;

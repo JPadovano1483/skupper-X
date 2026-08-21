@@ -111,20 +111,31 @@ export async function dropAccessPointCertificate(client, notify, accessId) {
         return objectNames;
     }
 
-    const tlsResult = await client.query("SELECT ObjectName FROM TlsCertificates WHERE Id = $1", [
-        certId,
-    ]);
-    if (tlsResult.rowCount == 1 && tlsResult.rows[0].objectname) {
-        objectNames.push(tlsResult.rows[0].objectname);
+    const tlsResult = await client.query(
+        "SELECT Id, ObjectName FROM TlsCertificates WHERE Id = $1",
+        [certId]
+    );
+    if (tlsResult.rowCount != 1 || !tlsResult.rows[0].objectname) {
+        return objectNames;
     }
+    const objectName = tlsResult.rows[0].objectname;
+    objectNames.push(objectName);
 
     await client.query("UPDATE BackboneAccessPoints SET Certificate = NULL WHERE Id = $1", [
         accessId,
     ]);
 
-    if (!(await isRevoked(client, certId))) {
-        await client.query("DELETE FROM TlsCertificates WHERE Id = $1", [certId]);
-        notify.delete("TlsCertificates", certId);
+    const chain = await client.query("SELECT Id FROM TlsCertificates WHERE ObjectName = $1", [
+        objectName,
+    ]);
+    await client.query("UPDATE TlsCertificates SET Supercedes = NULL WHERE ObjectName = $1", [
+        objectName,
+    ]);
+    for (const row of chain.rows) {
+        if (!(await isRevoked(client, row.id))) {
+            await client.query("DELETE FROM TlsCertificates WHERE Id = $1", [row.id]);
+            notify.delete("TlsCertificates", row.id);
+        }
     }
 
     return objectNames;

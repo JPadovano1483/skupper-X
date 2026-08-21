@@ -30,6 +30,7 @@ import * as resourceTemplates from "./resource-templates.js";
 import * as common from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import { dropAccessPointCertificate, deleteKubeTlsObjectList } from "./tls-revoke.js";
+import { getTlsRotationMeta } from "./tls-rotation.js";
 
 const coloNamespaces = {}; // {namespace-name: {backbone, site, accesspoint}}
 const backbonesWithNoNamespace = [];
@@ -281,17 +282,18 @@ async function runTheVisitQueue() {
     }
 }
 
-async function syncTlsSecretInNamespace(ns, secretName, mcSecretName, inject) {
+async function syncTlsSecretInNamespace(client, ns, secretName, mcSecretName, inject) {
     const mcSecret = await kube.LoadSecret(mcSecretName);
     if (!mcSecret) {
         return;
     }
-    const resource = resourceTemplates.Secret(mcSecret, secretName, inject);
+    const tlsMeta = await getTlsRotationMeta(client, mcSecretName);
+    const resource = resourceTemplates.Secret(mcSecret, secretName, inject, undefined, tlsMeta);
     const coloSecret = await kube.LoadSecret(secretName, ns);
     if (!coloSecret) {
         await kube.ApplyObject(resource, ns);
     } else if (
-        resourceTemplates.HashOfSecret(coloSecret) !== resourceTemplates.HashOfSecret(mcSecret)
+        resourceTemplates.HashOfSecret(coloSecret) !== resourceTemplates.HashOfSecret(resource)
     ) {
         await kube.ReplaceSecret(secretName, resource, ns);
     }
@@ -388,6 +390,7 @@ async function doVisitNamespace(ns) {
                 ])
                 .then((res) => res.rows[0]);
             await syncTlsSecretInNamespace(
+                client,
                 ns,
                 siteSecretName,
                 cert.objectname,
@@ -439,7 +442,7 @@ async function doVisitNamespace(ns) {
                     coloNamespaces[ns].accesspoint.certificate,
                 ])
                 .then((res) => res.rows[0]);
-            await syncTlsSecretInNamespace(ns, apSecretName, cert.objectname);
+            await syncTlsSecretInNamespace(client, ns, apSecretName, cert.objectname);
         }
 
         await client.query("COMMIT");

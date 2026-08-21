@@ -41,10 +41,11 @@ import {
     DeletePeer,
 } from "@vms/modules/state-sync";
 import { RegisterHandler } from "./backbone-links.js";
-import { HashOfSecret, HashOfData } from "./resource-templates.js";
+import { HashOfSecret, HashOfData, HashOfTlsPayload, tlsSyncData } from "./resource-templates.js";
 import { SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import { isRevoked, dropAccessPointCertificate, deleteKubeTlsObjectList } from "./tls-revoke.js";
+import { getTlsRotationMeta } from "./tls-rotation.js";
 
 const peers = {}; // {peerId: {pClass: <>, stuff}}
 
@@ -55,6 +56,10 @@ async function hashIfLiveTls(client, certId, objectName, expired = false) {
     const secret = await LoadSecret(objectName);
     if (!secret?.data) {
         return [null, null];
+    }
+    const tlsMeta = await getTlsRotationMeta(client, objectName);
+    if (tlsMeta) {
+        return [HashOfTlsPayload(secret.data, tlsMeta), tlsSyncData(secret.data, tlsMeta)];
     }
     return [HashOfSecret(secret), secret.data];
 }
@@ -800,7 +805,8 @@ export async function SiteCertificateChanged(certId) {
                 continue;
             }
             const secret = await LoadSecret(site.objectname);
-            const hash = HashOfSecret(secret);
+            const tlsMeta = await getTlsRotationMeta(client, site.objectname);
+            const hash = tlsMeta ? HashOfTlsPayload(secret.data, tlsMeta) : HashOfSecret(secret);
             await UpdateLocalState(site.id, `tls-site-${site.id}`, hash);
         }
         await client.query("COMMIT");
@@ -830,7 +836,10 @@ export async function AccessCertificateChanged(certId) {
             const row = result.rows[0];
             if (peers[row.id]) {
                 const secret = await LoadSecret(row.objectname);
-                const hash = HashOfSecret(secret);
+                const tlsMeta = await getTlsRotationMeta(client, row.objectname);
+                const hash = tlsMeta
+                    ? HashOfTlsPayload(secret.data, tlsMeta)
+                    : HashOfSecret(secret);
                 await UpdateLocalState(row.id, `tls-server-${row.apid}`, hash);
             }
         }

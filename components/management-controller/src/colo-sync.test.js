@@ -367,13 +367,22 @@ describe("colo-sync TLS secret sync", () => {
             if (sql.includes("FROM TlsClientRevocations")) {
                 return { rowCount: 0, rows: [] };
             }
+            if (sql.includes("FROM TlsCertificates WHERE ObjectName")) {
+                return { rowCount: 1, rows: [{ id: AP_CERT_ID }] };
+            }
             if (sql.includes("FROM TlsCertificates WHERE Id")) {
                 const certId = params[0];
                 if (certId === SITE_CERT_ID) {
-                    return { rowCount: 1, rows: [{ objectname: MC_SITE_SECRET_NAME }] };
+                    return {
+                        rowCount: 1,
+                        rows: [{ id: SITE_CERT_ID, objectname: MC_SITE_SECRET_NAME }],
+                    };
                 }
                 if (certId === AP_CERT_ID) {
-                    return { rowCount: 1, rows: [{ objectname: MC_AP_SECRET_NAME }] };
+                    return {
+                        rowCount: 1,
+                        rows: [{ id: AP_CERT_ID, objectname: MC_AP_SECRET_NAME }],
+                    };
                 }
             }
             if (sql.includes("UPDATE BackboneAccessPoints SET Certificate = NULL")) {

@@ -22,8 +22,10 @@
 import {
     ApplyObject,
     LoadCertificate,
+    LoadSecret,
     TriggerCertificateRenewal,
     ReplaceCertificate,
+    ReplaceSecret,
     setCertificateDnsName,
     WatchSecrets,
     WatchCertificates,
@@ -45,8 +47,9 @@ import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-managem
 import { refuseIfRevoked } from "./tls-revoke.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
-import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
+import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
+import { retargetParentCertificateFks, timestampsEqual } from "./tls-rotation.js";
 
 const lastObservedSecretResourceVersion = {};
 
@@ -680,7 +683,7 @@ async function secretAdded(dblink, secret) {
             if (is_ca) {
                 const issuer_obj = issuerObject(
                     secret.metadata.name,
-                    secret.metadata.annotations["skupper.io/vms-dblink"]
+                    secret.metadata.annotations[META_ANNOTATION_VMS_DBLINK]
                 );
                 await ApplyObject(issuer_obj);
             }
@@ -727,42 +730,122 @@ async function secretAdded(dblink, secret) {
     }
 }
 
+async function retargetTlsDbLink(objectName, newId, certObject) {
+    const cert = certObject || (await LoadCertificate(objectName));
+    if (cert) {
+        if (!cert.metadata.annotations) {
+            cert.metadata.annotations = {};
+        }
+        cert.metadata.annotations[META_ANNOTATION_VMS_DBLINK] = newId;
+        if (!cert.spec) {
+            cert.spec = {};
+        }
+        if (!cert.spec.secretTemplate) {
+            cert.spec.secretTemplate = { annotations: {} };
+        }
+        if (!cert.spec.secretTemplate.annotations) {
+            cert.spec.secretTemplate.annotations = {};
+        }
+        cert.spec.secretTemplate.annotations[META_ANNOTATION_VMS_DBLINK] = newId;
+        await ReplaceCertificate(cert);
+    }
+    const kubeSecret = await LoadSecret(objectName);
+    if (kubeSecret) {
+        if (!kubeSecret.metadata.annotations) {
+            kubeSecret.metadata.annotations = {};
+        }
+        kubeSecret.metadata.annotations[META_ANNOTATION_VMS_DBLINK] = newId;
+        await ReplaceSecret(objectName, kubeSecret);
+    }
+}
+
 //
 // A managed secret tied to an existing TlsCertificate has been renewed in place.
-// Update cert metadata and trigger downstream sync propagation.
+// Insert a superseding TlsCertificates row, retarget parent FKs, and leave the
+// predecessor until it expires.
 //
 async function secretRenewed(dblink, secret) {
     const client = await ClientFromPool("system");
     const notify = new NotifyTransaction();
+    let newId;
+    let objectName;
+    let certObject;
     try {
         await client.query("BEGIN");
         const certResult = await client.query(
-            "SELECT Id FROM TlsCertificates WHERE Id = $1 AND ObjectName = $2",
+            "SELECT Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Label FROM TlsCertificates WHERE Id = $1 AND ObjectName = $2",
             [dblink, secret.metadata.name]
         );
-        if (certResult.rowCount == 1) {
-            const cert_object = await LoadCertificate(secret.metadata.name);
-            const expiration = cert_object.status?.notAfter
-                ? new Date(cert_object.status.notAfter)
-                : undefined;
-            const renewal = cert_object.status?.renewalTime
-                ? new Date(cert_object.status.renewalTime)
-                : undefined;
-            await client.query(
-                "UPDATE TlsCertificates SET Expiration = $1, RenewalTime = $2 WHERE Id = $3",
-                [expiration, renewal, dblink]
-            );
-            notify.update("TlsCertificates", dblink);
+        if (certResult.rowCount != 1) {
+            return;
+        }
+        const oldCert = certResult.rows[0];
+        certObject = await LoadCertificate(secret.metadata.name);
+        const expiration = certObject.status?.notAfter
+            ? new Date(certObject.status.notAfter)
+            : undefined;
+        const renewal = certObject.status?.renewalTime
+            ? new Date(certObject.status.renewalTime)
+            : undefined;
+
+        const successor = await client.query(
+            "SELECT Id FROM TlsCertificates WHERE Supercedes = $1",
+            [oldCert.id]
+        );
+        if (successor.rowCount == 1) {
+            await retargetTlsDbLink(secret.metadata.name, successor.rows[0].id, certObject);
+            return;
+        }
+
+        if (!expiration || !oldCert.expiration || timestampsEqual(oldCert.expiration, expiration)) {
+            if (!oldCert.expiration || !timestampsEqual(oldCert.renewaltime, renewal)) {
+                await client.query(
+                    "UPDATE TlsCertificates SET Expiration = $1, RenewalTime = $2 WHERE Id = $3",
+                    [expiration ?? oldCert.expiration, renewal, oldCert.id]
+                );
+                notify.update("TlsCertificates", oldCert.id);
+            }
             await client.query("COMMIT");
             await notify.commit();
-            await SiteCertificateChanged(dblink);
-            await AccessCertificateChanged(dblink);
+            return;
         }
+
+        const inserted = await client.query(
+            "INSERT INTO TlsCertificates (Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Supercedes, Label) " +
+                "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8) RETURNING Id",
+            [
+                oldCert.isca,
+                oldCert.objectname,
+                oldCert.signedby,
+                expiration,
+                renewal,
+                (oldCert.rotationordinal ?? 0) + 1,
+                oldCert.id,
+                oldCert.label,
+            ]
+        );
+        newId = inserted.rows[0].id;
+        objectName = oldCert.objectname;
+        notify.add("TlsCertificates", newId);
+        await retargetParentCertificateFks(client, notify, oldCert.id, newId);
+        await client.query("COMMIT");
+        await notify.commit();
     } catch (err) {
         Log(`Rolling back secret-renewed transaction: ${err.stack}`);
         await client.query("ROLLBACK");
+        newId = undefined;
     } finally {
         client.release();
+    }
+
+    if (newId) {
+        try {
+            await retargetTlsDbLink(objectName, newId, certObject);
+        } catch (err) {
+            Log(`WARN: Failed to retarget vms-dblink to ${newId}: ${err.message}`);
+        }
+        await SiteCertificateChanged(newId);
+        await AccessCertificateChanged(newId);
     }
 }
 
@@ -800,7 +883,7 @@ const onSecretWatch = function (action, secret) {
     if (anno?.[META_ANNOTATION_VMS_CONTROLLED] != "true") {
         return;
     }
-    const dblink = anno["skupper.io/vms-dblink"];
+    const dblink = anno[META_ANNOTATION_VMS_DBLINK];
     if (!dblink) {
         return;
     }
@@ -823,9 +906,11 @@ const onSecretWatch = function (action, secret) {
 // Handle watch events on Certificates
 //
 const onCertificateWatch = async function (action, cert) {
+    const dblink = cert.metadata.annotations?.[META_ANNOTATION_VMS_DBLINK];
     if (
         action == "MODIFIED" &&
         cert.metadata.annotations?.[META_ANNOTATION_VMS_CONTROLLED] == "true" &&
+        dblink &&
         cert.status?.notAfter &&
         cert.status.renewalTime
     ) {
@@ -835,8 +920,9 @@ const onCertificateWatch = async function (action, cert) {
         const renewal = new Date(cert.status.renewalTime);
         try {
             const dbcert = await client.query(
-                "UPDATE TlsCertificates SET expiration = $1, renewalTime = $2 WHERE ObjectName = $3 RETURNING Id",
-                [expiration, renewal, cert.metadata.name]
+                "UPDATE TlsCertificates SET Expiration = $1, RenewalTime = $2 " +
+                    "WHERE Id = $3 AND (Expiration IS NULL OR Expiration = $1) RETURNING Id",
+                [expiration, renewal, dblink]
             );
             for (const dbrow of dbcert.rows) {
                 notify.update("TlsCertificates", dbrow.id);
@@ -885,7 +971,7 @@ const certificateObject = function (
         metadata: {
             name: name,
             annotations: {
-                "skupper.io/vms-dblink": db_link,
+                [META_ANNOTATION_VMS_DBLINK]: db_link,
             },
         },
         spec: {
@@ -893,7 +979,7 @@ const certificateObject = function (
             secretTemplate: {
                 annotations: {
                     [META_ANNOTATION_VMS_CONTROLLED]: "true",
-                    "skupper.io/vms-dblink": db_link,
+                    [META_ANNOTATION_VMS_DBLINK]: db_link,
                     "skupper.io/vms-issuerlink": issuer_link,
                 },
             },
@@ -939,7 +1025,7 @@ const issuerObject = function (name, db_link) {
         metadata: {
             name: name,
             annotations: {
-                "skupper.io/vms-dblink": db_link,
+                [META_ANNOTATION_VMS_DBLINK]: db_link,
             },
         },
         spec: {
@@ -1031,6 +1117,13 @@ export async function RotateCertificate(cid) {
         await refuseIfRevoked(client, cid);
         if (!cert.objectname) {
             throw httpError(400, "Certificate has no Kubernetes object");
+        }
+        const superseded = await client.query(
+            "SELECT Id FROM TlsCertificates WHERE Supercedes = $1",
+            [cid]
+        );
+        if (superseded.rowCount > 0) {
+            throw httpError(409, "Certificate has been superseded");
         }
         Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
         try {
