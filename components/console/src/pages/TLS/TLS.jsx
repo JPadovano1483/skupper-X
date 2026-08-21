@@ -23,7 +23,6 @@ import {
 } from "@carbon/react";
 import { Certificate, DocumentSigned } from "@carbon/icons-react";
 
-const CA_ROTATE_UNAVAILABLE = "CA certificate rotation is not supported";
 const CA_REVOKE_UNAVAILABLE = "CA certificate revocation is not supported";
 
 const certsUrl = ({ signedBy, expiresWithin } = {}) => {
@@ -171,9 +170,6 @@ const TLS = () => {
     };
 
     const handleRotate = async (cert) => {
-        if (cert.isca) {
-            return;
-        }
         try {
             setActionBusy(true);
             setActionNotice(null);
@@ -230,9 +226,7 @@ const TLS = () => {
         <OverflowMenu size="sm" flipped>
             <OverflowMenuItem
                 itemText="Rotate"
-                disabled={cert.isca || actionBusy}
-                requireTitle={cert.isca}
-                title={cert.isca ? CA_ROTATE_UNAVAILABLE : undefined}
+                disabled={actionBusy}
                 onClick={() => handleRotate(cert)}
             />
             <OverflowMenuItem

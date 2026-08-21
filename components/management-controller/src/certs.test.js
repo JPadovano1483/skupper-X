@@ -395,6 +395,7 @@ describe("onCertificateRequestsChange", () => {
                 spec: expect.objectContaining({
                     duration: "8760h",
                     renewBefore: "720h",
+                    privateKey: expect.not.objectContaining({ rotationPolicy: "Never" }),
                 }),
             })
         );
@@ -435,6 +436,49 @@ describe("onCertificateRequestsChange", () => {
                 spec: expect.objectContaining({
                     duration: "24h",
                     renewBefore: "8h",
+                }),
+            })
+        );
+    });
+
+    it("sets privateKey.rotationPolicy Never on CA Certificate CRs", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("FROM CertificateRequests WHERE RequestTime")) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: "cert-req-ca",
+                            requesttype: "backboneCA",
+                            durationhours: 8760,
+                        },
+                    ],
+                };
+            }
+            if (sql.includes("UPDATE CertificateRequests SET Lifecycle = 'cm_cert_created'")) {
+                return {};
+            }
+            return {};
+        });
+
+        await notificationHandlers.CertificateRequests("ADD", "cert-req-ca");
+
+        expect(ApplyObject).toHaveBeenCalledWith(
+            expect.objectContaining({
+                kind: "Certificate",
+                metadata: expect.objectContaining({
+                    name: "vms-bb-ca-cert-req-ca",
+                }),
+                spec: expect.objectContaining({
+                    isCA: true,
+                    usages: ["signing"],
+                    privateKey: expect.objectContaining({
+                        algorithm: "RSA",
+                        rotationPolicy: "Never",
+                    }),
                 }),
             })
         );
@@ -832,6 +876,8 @@ describe("RotateCertificate", () => {
             [certId]
         );
         expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
+        expect(LoadCertificate).not.toHaveBeenCalled();
+        expect(ReplaceCertificate).not.toHaveBeenCalled();
         expect(mockClient.release).toHaveBeenCalled();
     });
 
@@ -855,17 +901,70 @@ describe("RotateCertificate", () => {
         expect(mockClient.release).toHaveBeenCalled();
     });
 
-    it("refuses CA rotation", async () => {
-        mockClient.query.mockResolvedValue({
-            rowCount: 1,
-            rows: [{ ...certRow, isca: true }],
+    it("extends CA lifetime by renewing with rotationPolicy Never", async () => {
+        const caRow = { ...certRow, isca: true, objectname: "vms-bb-ca-1" };
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [caRow] };
         });
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-bb-ca-1" },
+            spec: {
+                isCA: true,
+                privateKey: { algorithm: "RSA", encoding: "PKCS1", size: 2048 },
+            },
+        });
+        TriggerCertificateRenewal.mockResolvedValue({});
 
-        await expect(RotateCertificate(certId)).rejects.toMatchObject({
-            statusCode: 409,
-            message: "CA certificate rotation is not supported",
+        await expect(RotateCertificate(certId)).resolves.toEqual(caRow);
+        expect(LoadCertificate).toHaveBeenCalledWith("vms-bb-ca-1");
+        expect(ReplaceCertificate).toHaveBeenCalledWith(
+            expect.objectContaining({
+                spec: expect.objectContaining({
+                    privateKey: expect.objectContaining({
+                        algorithm: "RSA",
+                        rotationPolicy: "Never",
+                    }),
+                }),
+            })
+        );
+        expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-bb-ca-1");
+    });
+
+    it("does not replace a CA Certificate CR that already has rotationPolicy Never", async () => {
+        const caRow = { ...certRow, isca: true, objectname: "vms-bb-ca-1" };
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [caRow] };
         });
-        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-bb-ca-1" },
+            spec: {
+                isCA: true,
+                privateKey: { algorithm: "RSA", rotationPolicy: "Never" },
+            },
+        });
+        TriggerCertificateRenewal.mockResolvedValue({});
+
+        await expect(RotateCertificate(certId)).resolves.toEqual(caRow);
+        expect(ReplaceCertificate).not.toHaveBeenCalled();
+        expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-bb-ca-1");
     });
 
     it("rejects a certificate with no Kubernetes object name", async () => {

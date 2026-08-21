@@ -994,6 +994,8 @@ const certificateObject = function (
                 algorithm: "RSA",
                 encoding: "PKCS1",
                 size: 2048,
+                // CA key rotation invalidates all children; extend lifetime with the same key.
+                ...(is_ca ? { rotationPolicy: "Never" } : {}),
             },
             usages: [usage],
             issuerRef: {
@@ -1091,8 +1093,36 @@ async function syncAccessPointDnsNames(client, certId, objectName) {
     }
 }
 
+function setCaPrivateKeyRotationNever(cert) {
+    if (!cert) {
+        return null;
+    }
+    if (cert.spec?.privateKey?.rotationPolicy === "Never") {
+        return null;
+    }
+    return {
+        ...cert,
+        spec: {
+            ...cert.spec,
+            privateKey: {
+                ...cert.spec?.privateKey,
+                rotationPolicy: "Never",
+            },
+        },
+    };
+}
+
+async function ensureCaRotationPolicyNever(objectName) {
+    const kubeCert = await LoadCertificate(objectName);
+    const updated = setCaPrivateKeyRotationNever(kubeCert);
+    if (updated) {
+        await ReplaceCertificate(updated);
+    }
+}
+
 //
 // Force in-place cert-manager renewal for an existing TlsCertificates row.
+// CAs use rotationPolicy Never so renew extends notAfter without rotating the key.
 // Does not insert CertificateRequests — that would create a differently
 // named Certificate CR and break the current FK/secret model.
 //
@@ -1111,9 +1141,6 @@ export async function RotateCertificate(cid) {
             throw httpError(404, "Certificate not found");
         }
         const cert = result.rows[0];
-        if (cert.isca) {
-            throw httpError(409, "CA certificate rotation is not supported");
-        }
         await refuseIfRevoked(client, cid);
         if (!cert.objectname) {
             throw httpError(400, "Certificate has no Kubernetes object");
@@ -1127,6 +1154,9 @@ export async function RotateCertificate(cid) {
         }
         Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
         try {
+            if (cert.isca) {
+                await ensureCaRotationPolicyNever(cert.objectname);
+            }
             await syncAccessPointDnsNames(client, cid, cert.objectname);
             await TriggerCertificateRenewal(cert.objectname);
         } catch (err) {
