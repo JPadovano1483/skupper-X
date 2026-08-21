@@ -31,6 +31,7 @@ import * as common from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import { dropAccessPointCertificate, deleteKubeTlsObjectList } from "./tls-revoke.js";
 import { getTlsRotationMeta } from "./tls-rotation.js";
+import { overlayDualTrustCa } from "./tls-ca-cascade.js";
 
 const coloNamespaces = {}; // {namespace-name: {backbone, site, accesspoint}}
 const backbonesWithNoNamespace = [];
@@ -282,13 +283,20 @@ async function runTheVisitQueue() {
     }
 }
 
-async function syncTlsSecretInNamespace(client, ns, secretName, mcSecretName, inject) {
+async function syncTlsSecretInNamespace(client, ns, secretName, mcSecretName, inject, certId) {
     const mcSecret = await kube.LoadSecret(mcSecretName);
     if (!mcSecret) {
         return;
     }
     const tlsMeta = await getTlsRotationMeta(client, mcSecretName);
-    const resource = resourceTemplates.Secret(mcSecret, secretName, inject, undefined, tlsMeta);
+    const data = await overlayDualTrustCa(client, certId, mcSecret.data);
+    const resource = resourceTemplates.Secret(
+        { ...mcSecret, data },
+        secretName,
+        inject,
+        undefined,
+        tlsMeta
+    );
     const coloSecret = await kube.LoadSecret(secretName, ns);
     if (!coloSecret) {
         await kube.ApplyObject(resource, ns);
@@ -394,7 +402,8 @@ async function doVisitNamespace(ns) {
                 ns,
                 siteSecretName,
                 cert.objectname,
-                common.INJECT_TYPE_SITE
+                common.INJECT_TYPE_SITE,
+                coloNamespaces[ns].site.certificate
             );
         }
 
@@ -442,7 +451,14 @@ async function doVisitNamespace(ns) {
                     coloNamespaces[ns].accesspoint.certificate,
                 ])
                 .then((res) => res.rows[0]);
-            await syncTlsSecretInNamespace(client, ns, apSecretName, cert.objectname);
+            await syncTlsSecretInNamespace(
+                client,
+                ns,
+                apSecretName,
+                cert.objectname,
+                undefined,
+                coloNamespaces[ns].accesspoint.certificate
+            );
         }
 
         await client.query("COMMIT");

@@ -37,8 +37,9 @@ const certsUrl = ({ signedBy, expiresWithin } = {}) => {
     return qs ? `/api/v1alpha1/certs?${qs}` : "/api/v1alpha1/certs";
 };
 
-const postCertAction = async (certId, action) => {
-    const response = await fetch(`/api/v1alpha1/certs/${certId}/${action}`, {
+const postCertAction = async (certId, action, query) => {
+    const qs = query ? `?${new URLSearchParams(query)}` : "";
+    const response = await fetch(`/api/v1alpha1/certs/${certId}/${action}${qs}`, {
         method: "POST",
     });
     if (!response.ok) {
@@ -65,7 +66,9 @@ const TLS = () => {
     const [actionNotice, setActionNotice] = useState(null);
     const [actionBusy, setActionBusy] = useState(false);
     const [certToRevoke, setCertToRevoke] = useState(null);
+    const [certToRotateKey, setCertToRotateKey] = useState(null);
     const [revokeError, setRevokeError] = useState(null);
+    const [rotateKeyError, setRotateKeyError] = useState(null);
 
     const fetchCertificates = useCallback(
         async ({ showLoading = true } = {}) => {
@@ -192,6 +195,36 @@ const TLS = () => {
         }
     };
 
+    const openRotateKeyModal = (cert) => {
+        if (!cert.isca) {
+            return;
+        }
+        setCertToRotateKey(cert);
+        setRotateKeyError(null);
+    };
+
+    const handleRotateKey = async () => {
+        if (!certToRotateKey?.isca) {
+            return;
+        }
+        try {
+            setActionBusy(true);
+            setRotateKeyError(null);
+            await postCertAction(certToRotateKey.id, "rotate", { rotateKey: "true" });
+            setActionNotice({
+                kind: "success",
+                title: "CA key rotation requested",
+                subtitle: certToRotateKey.label || certToRotateKey.id,
+            });
+            setCertToRotateKey(null);
+            await refreshCertificates();
+        } catch (err) {
+            setRotateKeyError(err.message);
+        } finally {
+            setActionBusy(false);
+        }
+    };
+
     const openRevokeModal = (cert) => {
         if (cert.isca) {
             return;
@@ -229,6 +262,13 @@ const TLS = () => {
                 disabled={actionBusy}
                 onClick={() => handleRotate(cert)}
             />
+            {cert.isca && (
+                <OverflowMenuItem
+                    itemText="Rotate CA key"
+                    disabled={actionBusy}
+                    onClick={() => openRotateKeyModal(cert)}
+                />
+            )}
             <OverflowMenuItem
                 itemText="Revoke"
                 isDelete
@@ -427,6 +467,37 @@ const TLS = () => {
                     </Table>
                 </TableContainer>
             )}
+
+            <Modal
+                open={Boolean(certToRotateKey)}
+                danger
+                modalHeading="Rotate CA key"
+                primaryButtonText="Rotate key"
+                secondaryButtonText="Cancel"
+                onRequestClose={() => {
+                    setCertToRotateKey(null);
+                    setRotateKeyError(null);
+                }}
+                onRequestSubmit={handleRotateKey}
+                primaryButtonDisabled={actionBusy || !certToRotateKey?.isca}
+            >
+                {rotateKeyError && (
+                    <InlineNotification
+                        kind="error"
+                        title="Cannot rotate CA key"
+                        subtitle={rotateKeyError}
+                        onCloseButtonClick={() => setRotateKeyError(null)}
+                        style={{ marginBottom: "1rem" }}
+                    />
+                )}
+
+                <p>
+                    Rotate the key for{" "}
+                    <strong>{certToRotateKey?.label || certToRotateKey?.id}</strong>? This issues a
+                    new CA and Issuer, re-issues every signed certificate, and keeps dual trust
+                    until cutover. This cannot be undone.
+                </p>
+            </Modal>
 
             <Modal
                 open={Boolean(certToRevoke)}

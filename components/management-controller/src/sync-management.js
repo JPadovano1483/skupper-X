@@ -41,11 +41,12 @@ import {
     DeletePeer,
 } from "@vms/modules/state-sync";
 import { RegisterHandler } from "./backbone-links.js";
-import { HashOfSecret, HashOfData, HashOfTlsPayload, tlsSyncData } from "./resource-templates.js";
+import { HashOfData, HashOfTlsPayload, tlsSyncData } from "./resource-templates.js";
 import { SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import { isRevoked, dropAccessPointCertificate, deleteKubeTlsObjectList } from "./tls-revoke.js";
 import { getTlsRotationMeta } from "./tls-rotation.js";
+import { overlayDualTrustCa } from "./tls-ca-cascade.js";
 
 const peers = {}; // {peerId: {pClass: <>, stuff}}
 
@@ -57,11 +58,12 @@ async function hashIfLiveTls(client, certId, objectName, expired = false) {
     if (!secret?.data) {
         return [null, null];
     }
+    const data = await overlayDualTrustCa(client, certId, secret.data);
     const tlsMeta = await getTlsRotationMeta(client, objectName);
     if (tlsMeta) {
-        return [HashOfTlsPayload(secret.data, tlsMeta), tlsSyncData(secret.data, tlsMeta)];
+        return [HashOfTlsPayload(data, tlsMeta), tlsSyncData(data, tlsMeta)];
     }
-    return [HashOfSecret(secret), secret.data];
+    return [HashOfData(data), data];
 }
 
 export async function GetBackboneLinks_TX(client, siteId) {
@@ -805,8 +807,12 @@ export async function SiteCertificateChanged(certId) {
                 continue;
             }
             const secret = await LoadSecret(site.objectname);
+            if (!secret?.data) {
+                continue;
+            }
+            const data = await overlayDualTrustCa(client, certId, secret.data);
             const tlsMeta = await getTlsRotationMeta(client, site.objectname);
-            const hash = tlsMeta ? HashOfTlsPayload(secret.data, tlsMeta) : HashOfSecret(secret);
+            const hash = tlsMeta ? HashOfTlsPayload(data, tlsMeta) : HashOfData(data);
             await UpdateLocalState(site.id, `tls-site-${site.id}`, hash);
         }
         await client.query("COMMIT");
@@ -836,11 +842,12 @@ export async function AccessCertificateChanged(certId) {
             const row = result.rows[0];
             if (peers[row.id]) {
                 const secret = await LoadSecret(row.objectname);
-                const tlsMeta = await getTlsRotationMeta(client, row.objectname);
-                const hash = tlsMeta
-                    ? HashOfTlsPayload(secret.data, tlsMeta)
-                    : HashOfSecret(secret);
-                await UpdateLocalState(row.id, `tls-server-${row.apid}`, hash);
+                if (secret?.data) {
+                    const data = await overlayDualTrustCa(client, certId, secret.data);
+                    const tlsMeta = await getTlsRotationMeta(client, row.objectname);
+                    const hash = tlsMeta ? HashOfTlsPayload(data, tlsMeta) : HashOfData(data);
+                    await UpdateLocalState(row.id, `tls-server-${row.apid}`, hash);
+                }
             }
         }
         await client.query("COMMIT");

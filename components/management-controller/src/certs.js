@@ -45,6 +45,7 @@ import {
 } from "./config.js";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
 import { refuseIfRevoked } from "./tls-revoke.js";
+import { certIdsToRefreshAfterIssuerCutover, rotateCaKey } from "./tls-ca-cascade.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
@@ -759,6 +760,19 @@ async function retargetTlsDbLink(objectName, newId, certObject) {
     }
 }
 
+const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
+
+function signedByForRenewal(secret, oldCert) {
+    const issuerLink = secret.metadata?.annotations?.[ISSUER_LINK_ANNOTATION];
+    if (!issuerLink) {
+        return oldCert.signedby;
+    }
+    if (issuerLink === "root") {
+        return null;
+    }
+    return issuerLink;
+}
+
 //
 // A managed secret tied to an existing TlsCertificate has been renewed in place.
 // Insert a superseding TlsCertificates row, retarget parent FKs, and leave the
@@ -770,6 +784,8 @@ async function secretRenewed(dblink, secret) {
     let newId;
     let objectName;
     let certObject;
+    let previousSignedBy;
+    let renewedSignedBy;
     try {
         await client.query("BEGIN");
         const certResult = await client.query(
@@ -810,13 +826,16 @@ async function secretRenewed(dblink, secret) {
             return;
         }
 
+        const signedBy = signedByForRenewal(secret, oldCert);
+        previousSignedBy = oldCert.signedby;
+        renewedSignedBy = signedBy;
         const inserted = await client.query(
             "INSERT INTO TlsCertificates (Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Supercedes, Label) " +
                 "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8) RETURNING Id",
             [
                 oldCert.isca,
                 oldCert.objectname,
-                oldCert.signedby,
+                signedBy,
                 expiration,
                 renewal,
                 (oldCert.rotationordinal ?? 0) + 1,
@@ -846,6 +865,19 @@ async function secretRenewed(dblink, secret) {
         }
         await SiteCertificateChanged(newId);
         await AccessCertificateChanged(newId);
+        if (renewedSignedBy && previousSignedBy && renewedSignedBy !== previousSignedBy) {
+            const refreshIds = await certIdsToRefreshAfterIssuerCutover(
+                renewedSignedBy,
+                previousSignedBy
+            );
+            for (const certId of refreshIds) {
+                if (certId === newId) {
+                    continue;
+                }
+                await SiteCertificateChanged(certId);
+                await AccessCertificateChanged(certId);
+            }
+        }
     }
 }
 
@@ -1123,10 +1155,12 @@ async function ensureCaRotationPolicyNever(objectName) {
 //
 // Force in-place cert-manager renewal for an existing TlsCertificates row.
 // CAs use rotationPolicy Never so renew extends notAfter without rotating the key.
+// Pass rotateKey: true to start a CA key-rotation cascade (new Issuer, dual-trust,
+// child re-issue) instead of a same-key lifetime extension.
 // Does not insert CertificateRequests — that would create a differently
 // named Certificate CR and break the current FK/secret model.
 //
-export async function RotateCertificate(cid) {
+export async function RotateCertificate(cid, options = {}) {
     if (!IsValidUuid(cid)) {
         throw httpError(400, `Malformed certificate ID: ${cid}`);
     }
@@ -1152,23 +1186,42 @@ export async function RotateCertificate(cid) {
         if (superseded.rowCount > 0) {
             throw httpError(409, "Certificate has been superseded");
         }
-        Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
-        try {
-            if (cert.isca) {
-                await ensureCaRotationPolicyNever(cert.objectname);
+        if (options.rotateKey) {
+            if (!cert.isca) {
+                throw httpError(
+                    409,
+                    "CA key rotation is only supported for certificate authorities"
+                );
             }
-            await syncAccessPointDnsNames(client, cid, cert.objectname);
-            await TriggerCertificateRenewal(cert.objectname);
-        } catch (err) {
-            if (kubeStatusCode(err) == 404) {
-                throw httpError(404, `Certificate object ${cert.objectname} not found`);
+        } else {
+            Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
+            try {
+                if (cert.isca) {
+                    await ensureCaRotationPolicyNever(cert.objectname);
+                }
+                await syncAccessPointDnsNames(client, cid, cert.objectname);
+                await TriggerCertificateRenewal(cert.objectname);
+            } catch (err) {
+                if (kubeStatusCode(err) == 404) {
+                    throw httpError(404, `Certificate object ${cert.objectname} not found`);
+                }
+                throw err;
             }
-            throw err;
+            return cert;
         }
-        return cert;
     } finally {
         client.release();
     }
+
+    const result = await rotateCaKey(cid, options);
+    const refreshCertIds = result.refreshCertIds || [];
+    for (const certId of refreshCertIds) {
+        await SiteCertificateChanged(certId);
+        await AccessCertificateChanged(certId);
+    }
+    const payload = { ...result };
+    delete payload.refreshCertIds;
+    return payload;
 }
 
 export async function Start() {

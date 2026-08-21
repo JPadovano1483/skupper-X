@@ -46,6 +46,7 @@ import { HashOfData, HashOfSecret } from "./resource-templates.js";
 import { NotifyTransaction } from "./notify.js";
 import { isRevoked } from "./tls-revoke.js";
 import { getTlsRotationMeta } from "./tls-rotation.js";
+import { overlayDualTrustCa } from "./tls-ca-cascade.js";
 
 const backbones = {}; // backboneId => {conn: AMQP-Connection, sender: anon-sender, receiver: claim-receiver}
 const memberCompletions = {}; // memberId   => {handler: completion-function, result: undefined || {}, error: undefined || ERROR }
@@ -80,10 +81,11 @@ const memberCompletion = async function (memberId) {
         //
         const secret = await LoadSecret(memberSite.objectname);
         const tlsMeta = await getTlsRotationMeta(client, memberSite.objectname);
+        const data = await overlayDualTrustCa(client, memberSite.certificate, secret.data);
         siteClient = {
             apiVersion: "v1",
             kind: "Secret",
-            data: secret.data,
+            data: data,
             metadata: {
                 name: `vms-site-${memberId}`,
                 annotations: {

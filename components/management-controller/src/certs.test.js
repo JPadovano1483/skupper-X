@@ -61,6 +61,11 @@ vi.mock("@vms/modules/kube", () => ({
     GetIssuers: vi.fn(async () => []),
 }));
 
+vi.mock("./tls-ca-cascade.js", () => ({
+    rotateCaKey: vi.fn(),
+    certIdsToRefreshAfterIssuerCutover: vi.fn(async () => []),
+}));
+
 vi.mock("./config.js", () => ({
     BackboneExpiration: vi.fn(() => ({ years: 1 })),
     DefaultCaExpiration: vi.fn(() => ({ days: 30 })),
@@ -124,6 +129,7 @@ vi.mock("./notify.js", () => ({
 }));
 
 import { Start, RotateCertificate } from "./certs.js";
+import { rotateCaKey, certIdsToRefreshAfterIssuerCutover } from "./tls-ca-cascade.js";
 import { RegisterNotification } from "./notify.js";
 import {
     ApplyObject,
@@ -836,6 +842,59 @@ describe("onSecretWatch", () => {
         );
         expect(SiteCertificateChanged).not.toHaveBeenCalled();
     });
+
+    it("uses the secret issuerlink as SignedBy when the leaf is re-issued under a new CA", async () => {
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-interior-cert-1", annotations: {} },
+            spec: { secretTemplate: { annotations: {} } },
+            status: {
+                notAfter: "2026-10-12T12:00:00.000Z",
+                renewalTime: "2026-10-11T12:00:00.000Z",
+            },
+        });
+        certIdsToRefreshAfterIssuerCutover.mockResolvedValue(["sibling-1"]);
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+                return { rowCount: 1, rows: [oldCert] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("INSERT INTO TlsCertificates")) {
+                return { rows: [{ id: "cert-2" }] };
+            }
+            if (sql.includes("SET Certificate = $1 WHERE Certificate = $2")) {
+                return { rows: [] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        const secret = modifiedSecret("102");
+        secret.metadata.annotations["skupper.io/vms-issuerlink"] = "new-ca";
+        secretWatchHandler("MODIFIED", secret);
+
+        await vi.waitFor(() => {
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-2");
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("sibling-1");
+        });
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("INSERT INTO TlsCertificates"),
+            expect.arrayContaining([
+                oldCert.isca,
+                oldCert.objectname,
+                "new-ca",
+                expect.any(Date),
+                expect.any(Date),
+                1,
+                oldCert.id,
+                oldCert.label,
+            ])
+        );
+        expect(certIdsToRefreshAfterIssuerCutover).toHaveBeenCalledWith("new-ca", oldCert.signedby);
+    });
 });
 
 describe("RotateCertificate", () => {
@@ -1089,5 +1148,41 @@ describe("RotateCertificate", () => {
 
         expect(ReplaceCertificate).not.toHaveBeenCalled();
         expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
+    });
+
+    it("starts a CA key-rotation cascade when rotateKey is set", async () => {
+        const caRow = { ...certRow, isca: true, objectname: "vms-bb-ca-1" };
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [caRow] };
+        });
+        rotateCaKey.mockResolvedValue({
+            ...caRow,
+            keyRotation: { newCertificateId: "new-ca", objectName: "vms-bb-ca-new", children: [] },
+            refreshCertIds: ["leaf-1"],
+        });
+
+        await expect(RotateCertificate(certId, { rotateKey: true })).resolves.toEqual({
+            ...caRow,
+            keyRotation: { newCertificateId: "new-ca", objectName: "vms-bb-ca-new", children: [] },
+        });
+        expect(rotateCaKey).toHaveBeenCalledWith(certId, { rotateKey: true });
+        expect(SiteCertificateChanged).toHaveBeenCalledWith("leaf-1");
+        expect(AccessCertificateChanged).toHaveBeenCalledWith("leaf-1");
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
+    it("refuses rotateKey on a leaf certificate", async () => {
+        await expect(RotateCertificate(certId, { rotateKey: true })).rejects.toMatchObject({
+            statusCode: 409,
+            message: "CA key rotation is only supported for certificate authorities",
+        });
+        expect(rotateCaKey).not.toHaveBeenCalled();
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
     });
 });
