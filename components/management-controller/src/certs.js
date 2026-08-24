@@ -44,11 +44,15 @@ import {
     CertOrganization,
 } from "./config.js";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
-import { refuseIfRevoked } from "./tls-revoke.js";
+import { refuseIfRevoked, RevokeCertificate } from "./tls-revoke.js";
 import { certIdsToRefreshAfterIssuerCutover, rotateCaKey } from "./tls-ca-cascade.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
-import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
+import {
+    META_ANNOTATION_VMS_CONTROLLED,
+    META_ANNOTATION_VMS_DBLINK,
+    META_ANNOTATION_TLS_REVOKE_PREDECESSOR,
+} from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import { retargetParentCertificateFks, timestampsEqual } from "./tls-rotation.js";
 
@@ -773,6 +777,39 @@ function signedByForRenewal(secret, oldCert) {
     return issuerLink;
 }
 
+function isRevokePredecessorRequested(cert) {
+    return cert?.metadata?.annotations?.[META_ANNOTATION_TLS_REVOKE_PREDECESSOR] == "true";
+}
+
+function unsetRevokePredecessorAnnotation(cert) {
+    if (cert?.metadata?.annotations) {
+        delete cert.metadata.annotations[META_ANNOTATION_TLS_REVOKE_PREDECESSOR];
+    }
+}
+
+async function setRevokePredecessorAnnotation(objectName) {
+    const cert = await LoadCertificate(objectName);
+    if (!cert) {
+        throw httpError(404, `Certificate object ${objectName} not found`);
+    }
+    if (!cert.metadata) {
+        cert.metadata = {};
+    }
+    if (!cert.metadata.annotations) {
+        cert.metadata.annotations = {};
+    }
+    cert.metadata.annotations[META_ANNOTATION_TLS_REVOKE_PREDECESSOR] = "true";
+    await ReplaceCertificate(cert);
+}
+
+async function revokePredecessorAfterRenew(oldId, certObject) {
+    if (!isRevokePredecessorRequested(certObject)) {
+        return;
+    }
+    await RevokeCertificate(oldId);
+    unsetRevokePredecessorAnnotation(certObject);
+}
+
 //
 // A managed secret tied to an existing TlsCertificate has been renewed in place.
 // Insert a superseding TlsCertificates row, retarget parent FKs, and leave the
@@ -782,6 +819,7 @@ async function secretRenewed(dblink, secret) {
     const client = await ClientFromPool("system");
     const notify = new NotifyTransaction();
     let newId;
+    let predecessorId;
     let objectName;
     let certObject;
     let previousSignedBy;
@@ -796,6 +834,7 @@ async function secretRenewed(dblink, secret) {
             return;
         }
         const oldCert = certResult.rows[0];
+        predecessorId = oldCert.id;
         certObject = await LoadCertificate(secret.metadata.name);
         const expiration = certObject.status?.notAfter
             ? new Date(certObject.status.notAfter)
@@ -809,6 +848,11 @@ async function secretRenewed(dblink, secret) {
             [oldCert.id]
         );
         if (successor.rowCount == 1) {
+            try {
+                await revokePredecessorAfterRenew(oldCert.id, certObject);
+            } catch (err) {
+                Log(`WARN: Failed to revoke predecessor ${oldCert.id}: ${err.message}`);
+            }
             await retargetTlsDbLink(secret.metadata.name, successor.rows[0].id, certObject);
             return;
         }
@@ -858,6 +902,11 @@ async function secretRenewed(dblink, secret) {
     }
 
     if (newId) {
+        try {
+            await revokePredecessorAfterRenew(predecessorId, certObject);
+        } catch (err) {
+            Log(`WARN: Failed to revoke predecessor ${predecessorId}: ${err.message}`);
+        }
         try {
             await retargetTlsDbLink(objectName, newId, certObject);
         } catch (err) {
@@ -1186,6 +1235,12 @@ export async function RotateCertificate(cid, options = {}) {
         if (superseded.rowCount > 0) {
             throw httpError(409, "Certificate has been superseded");
         }
+        if (options.revokePredecessor && options.rotateKey) {
+            throw httpError(409, "Cannot combine predecessor revocation with CA key rotation");
+        }
+        if (options.revokePredecessor && cert.isca) {
+            throw httpError(409, "CA certificate revocation is not supported");
+        }
         if (options.rotateKey) {
             if (!cert.isca) {
                 throw httpError(
@@ -1200,6 +1255,9 @@ export async function RotateCertificate(cid, options = {}) {
                     await ensureCaRotationPolicyNever(cert.objectname);
                 }
                 await syncAccessPointDnsNames(client, cid, cert.objectname);
+                if (options.revokePredecessor) {
+                    await setRevokePredecessorAnnotation(cert.objectname);
+                }
                 await TriggerCertificateRenewal(cert.objectname);
             } catch (err) {
                 if (kubeStatusCode(err) == 404) {

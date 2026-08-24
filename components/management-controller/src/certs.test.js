@@ -59,6 +59,8 @@ vi.mock("@vms/modules/kube", () => ({
     }),
     WatchCertificates: vi.fn(),
     GetIssuers: vi.fn(async () => []),
+    DeleteSecret: vi.fn(),
+    DeleteCertificate: vi.fn(),
 }));
 
 vi.mock("./tls-ca-cascade.js", () => ({
@@ -139,8 +141,11 @@ import {
     ReplaceCertificate,
     ReplaceSecret,
     setCertificateDnsName,
+    DeleteSecret,
+    DeleteCertificate,
 } from "@vms/modules/kube";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
+import { META_ANNOTATION_TLS_REVOKE_PREDECESSOR } from "@vms/modules/common";
 
 function transactionSql(sql) {
     return sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK";
@@ -895,6 +900,102 @@ describe("onSecretWatch", () => {
         );
         expect(certIdsToRefreshAfterIssuerCutover).toHaveBeenCalledWith("new-ca", oldCert.signedby);
     });
+
+    it("revokes the predecessor when the Certificate CR has the revoke-predecessor annotation", async () => {
+        const predecessorId = "00000000-0000-4000-8000-000000000001";
+        const successorId = "00000000-0000-4000-8000-000000000002";
+        const predecessor = { ...oldCert, id: predecessorId };
+        LoadCertificate.mockResolvedValue({
+            metadata: {
+                name: "vms-interior-cert-1",
+                annotations: {
+                    [META_ANNOTATION_TLS_REVOKE_PREDECESSOR]: "true",
+                },
+            },
+            spec: { secretTemplate: { annotations: {} } },
+            status: {
+                notAfter: "2026-10-12T12:00:00.000Z",
+                renewalTime: "2026-10-11T12:00:00.000Z",
+            },
+        });
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+                return { rowCount: 1, rows: [predecessor] };
+            }
+            if (
+                sql.includes("SELECT id, objectname, label, isca, expiration FROM TlsCertificates")
+            ) {
+                return {
+                    rowCount: 1,
+                    rows: [
+                        {
+                            id: predecessorId,
+                            objectname: predecessor.objectname,
+                            label: predecessor.label,
+                            isca: false,
+                            expiration: predecessor.expiration,
+                        },
+                    ],
+                };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("INSERT INTO TlsCertificates")) {
+                return { rows: [{ id: successorId }] };
+            }
+            if (sql.includes("INSERT INTO TlsClientRevocations")) {
+                return { rowCount: 1 };
+            }
+            if (sql.includes("SELECT 1 FROM TlsCertificates WHERE ObjectName")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            if (sql.includes("SET Certificate = $1 WHERE Certificate = $2")) {
+                return { rows: [] };
+            }
+            if (sql.includes("ORDER BY RotationOrdinal DESC")) {
+                return { rowCount: 1, rows: [{ id: successorId }] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        secretWatchHandler("MODIFIED", {
+            metadata: {
+                name: "vms-interior-cert-1",
+                resourceVersion: "200",
+                annotations: {
+                    "skupper.io/vms-controlled": "true",
+                    "skupper.io/vms-dblink": predecessorId,
+                },
+            },
+            data: {
+                "tls.crt": "base64-cert",
+            },
+        });
+
+        await vi.waitFor(() => {
+            expect(mockClient.query).toHaveBeenCalledWith(
+                expect.stringContaining("INSERT INTO TlsClientRevocations"),
+                [predecessorId, predecessor.expiration, "Revoked via API"]
+            );
+        });
+        expect(DeleteSecret).not.toHaveBeenCalled();
+        expect(DeleteCertificate).not.toHaveBeenCalled();
+        expect(ReplaceCertificate).toHaveBeenCalledWith(
+            expect.objectContaining({
+                metadata: expect.objectContaining({
+                    annotations: expect.not.objectContaining({
+                        [META_ANNOTATION_TLS_REVOKE_PREDECESSOR]: "true",
+                    }),
+                }),
+            })
+        );
+        expect(SiteCertificateChanged).toHaveBeenCalledWith(successorId);
+        expect(AccessCertificateChanged).toHaveBeenCalledWith(successorId);
+    });
 });
 
 describe("RotateCertificate", () => {
@@ -1184,5 +1285,64 @@ describe("RotateCertificate", () => {
         });
         expect(rotateCaKey).not.toHaveBeenCalled();
         expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
+    it("annotates the Certificate CR then triggers renewal when revokePredecessor is set", async () => {
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-interior-cert-1", annotations: {} },
+            spec: {},
+        });
+        TriggerCertificateRenewal.mockResolvedValue({});
+
+        await expect(RotateCertificate(certId, { revokePredecessor: true })).resolves.toEqual(
+            certRow
+        );
+        expect(ReplaceCertificate).toHaveBeenCalledWith(
+            expect.objectContaining({
+                metadata: expect.objectContaining({
+                    annotations: expect.objectContaining({
+                        [META_ANNOTATION_TLS_REVOKE_PREDECESSOR]: "true",
+                    }),
+                }),
+            })
+        );
+        expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
+        expect(ReplaceCertificate.mock.invocationCallOrder[0]).toBeLessThan(
+            TriggerCertificateRenewal.mock.invocationCallOrder[0]
+        );
+        expect(rotateCaKey).not.toHaveBeenCalled();
+    });
+
+    it("refuses revokePredecessor on a CA", async () => {
+        const caRow = { ...certRow, isca: true, objectname: "vms-bb-ca-1" };
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("WHERE Supercedes = $1")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [caRow] };
+        });
+
+        await expect(RotateCertificate(certId, { revokePredecessor: true })).rejects.toMatchObject({
+            statusCode: 409,
+            message: "CA certificate revocation is not supported",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+        expect(ReplaceCertificate).not.toHaveBeenCalled();
+        expect(rotateCaKey).not.toHaveBeenCalled();
+    });
+
+    it("refuses combining revokePredecessor with rotateKey", async () => {
+        await expect(
+            RotateCertificate(certId, { revokePredecessor: true, rotateKey: true })
+        ).rejects.toMatchObject({
+            statusCode: 409,
+            message: "Cannot combine predecessor revocation with CA key rotation",
+        });
+        expect(rotateCaKey).not.toHaveBeenCalled();
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+        expect(ReplaceCertificate).not.toHaveBeenCalled();
     });
 });

@@ -25,6 +25,7 @@ import {
     META_ANNOTATION_STATE_ID,
     META_ANNOTATION_TLS_ORDINAL,
     META_ANNOTATION_TLS_LAST_VALID,
+    META_ANNOTATION_TLS_REVOKE_PREDECESSOR,
     STATE_TYPE_LINK,
     MEMBER_CONFIG_MAP_NAME,
 } from "./common.js";
@@ -40,6 +41,7 @@ describe("common constants", () => {
         expect(META_ANNOTATION_STATE_ID).toBe("vms/state-id");
         expect(META_ANNOTATION_TLS_ORDINAL).toBe("vms/tls-ordinal");
         expect(META_ANNOTATION_TLS_LAST_VALID).toBe("vms/tls-last-valid");
+        expect(META_ANNOTATION_TLS_REVOKE_PREDECESSOR).toBe("skupper.io/vms-revoke-predecessor");
     });
 
     it("exports state and object names", () => {
