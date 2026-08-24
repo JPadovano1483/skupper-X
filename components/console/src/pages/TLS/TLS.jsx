@@ -24,6 +24,7 @@ import {
 import { Certificate, DocumentSigned } from "@carbon/icons-react";
 
 const CA_REVOKE_UNAVAILABLE = "CA certificate revocation is not supported";
+const CA_REVOKE_AND_ROTATE_UNAVAILABLE = "CA certificate revoke and rotate is not supported";
 
 const certsUrl = ({ signedBy, expiresWithin } = {}) => {
     const params = new URLSearchParams();
@@ -66,8 +67,10 @@ const TLS = () => {
     const [actionNotice, setActionNotice] = useState(null);
     const [actionBusy, setActionBusy] = useState(false);
     const [certToRevoke, setCertToRevoke] = useState(null);
+    const [certToRevokeAndRotate, setCertToRevokeAndRotate] = useState(null);
     const [certToRotateKey, setCertToRotateKey] = useState(null);
     const [revokeError, setRevokeError] = useState(null);
+    const [revokeAndRotateError, setRevokeAndRotateError] = useState(null);
     const [rotateKeyError, setRotateKeyError] = useState(null);
 
     const fetchCertificates = useCallback(
@@ -225,6 +228,36 @@ const TLS = () => {
         }
     };
 
+    const openRevokeAndRotateModal = (cert) => {
+        if (cert.isca) {
+            return;
+        }
+        setCertToRevokeAndRotate(cert);
+        setRevokeAndRotateError(null);
+    };
+
+    const handleRevokeAndRotate = async () => {
+        if (!certToRevokeAndRotate || certToRevokeAndRotate.isca) {
+            return;
+        }
+        try {
+            setActionBusy(true);
+            setRevokeAndRotateError(null);
+            await postCertAction(certToRevokeAndRotate.id, "revoke-and-rotate");
+            setActionNotice({
+                kind: "success",
+                title: "Certificate revoke and rotate requested",
+                subtitle: certToRevokeAndRotate.label || certToRevokeAndRotate.id,
+            });
+            setCertToRevokeAndRotate(null);
+            await refreshCertificates();
+        } catch (err) {
+            setRevokeAndRotateError(err.message);
+        } finally {
+            setActionBusy(false);
+        }
+    };
+
     const openRevokeModal = (cert) => {
         if (cert.isca) {
             return;
@@ -269,6 +302,14 @@ const TLS = () => {
                     onClick={() => openRotateKeyModal(cert)}
                 />
             )}
+            <OverflowMenuItem
+                itemText="Revoke and rotate"
+                isDelete
+                disabled={cert.isca || actionBusy}
+                requireTitle={cert.isca}
+                title={cert.isca ? CA_REVOKE_AND_ROTATE_UNAVAILABLE : undefined}
+                onClick={() => openRevokeAndRotateModal(cert)}
+            />
             <OverflowMenuItem
                 itemText="Revoke"
                 isDelete
@@ -496,6 +537,39 @@ const TLS = () => {
                     <strong>{certToRotateKey?.label || certToRotateKey?.id}</strong>? This issues a
                     new CA and Issuer, re-issues every signed certificate, and keeps dual trust
                     until cutover. This cannot be undone.
+                </p>
+            </Modal>
+
+            <Modal
+                open={Boolean(certToRevokeAndRotate)}
+                danger
+                modalHeading="Revoke and rotate certificate"
+                primaryButtonText="Revoke and rotate"
+                secondaryButtonText="Cancel"
+                onRequestClose={() => {
+                    setCertToRevokeAndRotate(null);
+                    setRevokeAndRotateError(null);
+                }}
+                onRequestSubmit={handleRevokeAndRotate}
+                primaryButtonDisabled={
+                    actionBusy || !certToRevokeAndRotate || certToRevokeAndRotate.isca
+                }
+            >
+                {revokeAndRotateError && (
+                    <InlineNotification
+                        kind="error"
+                        title="Cannot revoke and rotate certificate"
+                        subtitle={revokeAndRotateError}
+                        onCloseButtonClick={() => setRevokeAndRotateError(null)}
+                        style={{ marginBottom: "1rem" }}
+                    />
+                )}
+
+                <p>
+                    Revoke and rotate{" "}
+                    <strong>{certToRevokeAndRotate?.label || certToRevokeAndRotate?.id}</strong>?
+                    This issues a new certificate and immediately invalidates the old one. Sessions
+                    using the old certificate may drop.
                 </p>
             </Modal>
 
