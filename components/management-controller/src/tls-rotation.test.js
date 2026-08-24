@@ -91,6 +91,32 @@ describe("getTlsRotationMeta", () => {
             lastValid: 1,
         });
     });
+
+    it("bumps lastValid past revoked predecessors", async () => {
+        client.query.mockResolvedValue({
+            rowCount: 2,
+            rows: [
+                {
+                    rotationordinal: 0,
+                    expiration: new Date("2099-01-01T00:00:00.000Z"),
+                    revoked: true,
+                },
+                {
+                    rotationordinal: 1,
+                    expiration: new Date("2099-06-01T00:00:00.000Z"),
+                    revoked: false,
+                },
+            ],
+        });
+
+        await expect(getTlsRotationMeta(client, "vms-site-1")).resolves.toEqual({
+            ordinal: 1,
+            lastValid: 1,
+        });
+        expect(client.query).toHaveBeenCalledWith(expect.stringContaining("TlsClientRevocations"), [
+            "vms-site-1",
+        ]);
+    });
 });
 
 describe("getCurrentCertificateId", () => {

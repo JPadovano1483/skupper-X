@@ -45,7 +45,9 @@ export async function getTlsRotationMeta(client, objectName) {
         return null;
     }
     const result = await client.query(
-        "SELECT RotationOrdinal, Expiration FROM TlsCertificates WHERE ObjectName = $1",
+        "SELECT RotationOrdinal, Expiration, " +
+            "EXISTS (SELECT 1 FROM TlsClientRevocations r WHERE r.CertificateId = TlsCertificates.Id) AS Revoked " +
+            "FROM TlsCertificates WHERE ObjectName = $1",
         [objectName]
     );
     if (result.rowCount == 0 || result.rows.length == 0) {
@@ -60,7 +62,7 @@ export async function getTlsRotationMeta(client, objectName) {
             ordinal = rotationOrdinal;
         }
         const expirationMs = row.expiration ? new Date(row.expiration).getTime() : null;
-        if (expirationMs == null || expirationMs > now) {
+        if (!row.revoked && (expirationMs == null || expirationMs > now)) {
             if (lastValid == null || rotationOrdinal < lastValid) {
                 lastValid = rotationOrdinal;
             }
