@@ -470,6 +470,16 @@ const revokeCert = async function (req, res) {
     }
 };
 
+const revokeAndRotateCert = async function (req, res) {
+    try {
+        const cert = await RotateCertificate(req.params.cid, { revokePredecessor: true });
+        res.status(202).json(cert);
+    } catch (err) {
+        const returnStatus = err.statusCode || 500;
+        res.status(returnStatus).send(err.message);
+    }
+};
+
 export async function AddHostToAccessPoint(req, siteId, apid, hostname, port) {
     let retval = 1;
     const client = await ClientFromPool();
@@ -700,6 +710,14 @@ export async function Initialize(router, auth) {
         auth.protect("realm:certificate-manager"),
         async (req, res) => {
             await revokeCert(req, res);
+        }
+    );
+
+    router.post(
+        API_PREFIX + "certs/:cid/revoke-and-rotate",
+        auth.protect("realm:certificate-manager"),
+        async (req, res) => {
+            await revokeAndRotateCert(req, res);
         }
     );
 
