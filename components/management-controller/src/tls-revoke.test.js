@@ -37,6 +37,11 @@ vi.mock("@vms/modules/state-sync", () => ({
     UpdateLocalState: vi.fn(),
 }));
 
+vi.mock("./sync-management.js", () => ({
+    SiteCertificateChanged: vi.fn(async () => {}),
+    AccessCertificateChanged: vi.fn(async () => {}),
+}));
+
 import {
     isRevoked,
     refuseIfRevoked,
@@ -51,8 +56,15 @@ import {
 import { ClientFromPool } from "./db.js";
 import { DeleteSecret, DeleteCertificate } from "@vms/modules/kube";
 import { UpdateLocalState } from "@vms/modules/state-sync";
+import { AccessCertificateChanged, SiteCertificateChanged } from "./sync-management.js";
+import { TLS_CERTIFICATE_PARENT_TABLES } from "./tls-rotation.js";
 
 const CERT_ID = "00000000-0000-4000-8000-000000000007";
+const SUCCESSOR_ID = "00000000-0000-4000-8000-000000000008";
+
+function parentFkSql(table) {
+    return `SELECT 1 FROM ${table} WHERE Certificate = $1 LIMIT 1`;
+}
 
 describe("isRevoked", () => {
     it("returns false when certId is missing", async () => {
@@ -174,17 +186,31 @@ describe("RevokeCertificate", () => {
         DeleteSecret.mockResolvedValue({});
         DeleteCertificate.mockResolvedValue({});
         mockClient.query.mockImplementation(async (sql) => {
-            if (sql.includes("FROM TlsCertificates")) {
+            if (
+                sql.includes("SELECT id, objectname, label, isca, expiration FROM TlsCertificates")
+            ) {
                 return { rowCount: 1, rows: [certRow] };
             }
             if (sql.includes("INSERT INTO TlsClientRevocations")) {
                 return { rowCount: 1 };
             }
+            if (sql.includes("SELECT 1 FROM TlsCertificates WHERE ObjectName")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql === parentFkSql("MemberSites")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            if (
+                sql.startsWith("SELECT 1 FROM ") &&
+                sql.includes("WHERE Certificate = $1 LIMIT 1")
+            ) {
+                return { rowCount: 0, rows: [] };
+            }
             if (sql.includes("FROM MemberSites")) {
-                return { rows: [{ id: "member-1" }] };
+                return { rowCount: 1, rows: [{ id: "member-1" }] };
             }
             if (sql.includes("FROM InteriorSites") || sql.includes("FROM BackboneAccessPoints")) {
-                return { rows: [] };
+                return { rowCount: 0, rows: [] };
             }
             return { rows: [], rowCount: 0 };
         });
@@ -200,7 +226,90 @@ describe("RevokeCertificate", () => {
         expect(DeleteSecret).toHaveBeenCalledWith("vms-member-cert-1");
         expect(DeleteCertificate).toHaveBeenCalledWith("vms-member-cert-1");
         expect(UpdateLocalState).toHaveBeenCalledWith("member-1", "tls-site-member-1", null);
+        expect(SiteCertificateChanged).not.toHaveBeenCalled();
+        expect(AccessCertificateChanged).not.toHaveBeenCalled();
         expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it("skips kube delete when another row shares objectname", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (
+                sql.includes("SELECT id, objectname, label, isca, expiration FROM TlsCertificates")
+            ) {
+                return { rowCount: 1, rows: [certRow] };
+            }
+            if (sql.includes("INSERT INTO TlsClientRevocations")) {
+                return { rowCount: 1 };
+            }
+            if (sql.includes("SELECT 1 FROM TlsCertificates WHERE ObjectName")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            if (sql === parentFkSql("MemberSites")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            if (
+                sql.startsWith("SELECT 1 FROM ") &&
+                sql.includes("WHERE Certificate = $1 LIMIT 1")
+            ) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM MemberSites")) {
+                return { rowCount: 1, rows: [{ id: "member-1" }] };
+            }
+            if (sql.includes("FROM InteriorSites") || sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        await RevokeCertificate(CERT_ID);
+
+        expect(DeleteSecret).not.toHaveBeenCalled();
+        expect(DeleteCertificate).not.toHaveBeenCalled();
+        expect(UpdateLocalState).toHaveBeenCalledWith("member-1", "tls-site-member-1", null);
+        expect(SiteCertificateChanged).not.toHaveBeenCalled();
+        expect(AccessCertificateChanged).not.toHaveBeenCalled();
+    });
+
+    it("skips advertiseTlsRevoked for predecessors and advertises lastValid on the successor", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (
+                sql.includes("SELECT id, objectname, label, isca, expiration FROM TlsCertificates")
+            ) {
+                return { rowCount: 1, rows: [certRow] };
+            }
+            if (sql.includes("INSERT INTO TlsClientRevocations")) {
+                return { rowCount: 1 };
+            }
+            if (sql.includes("SELECT 1 FROM TlsCertificates WHERE ObjectName")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            if (
+                sql.startsWith("SELECT 1 FROM ") &&
+                sql.includes("WHERE Certificate = $1 LIMIT 1")
+            ) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("ORDER BY RotationOrdinal DESC")) {
+                return { rowCount: 1, rows: [{ id: SUCCESSOR_ID }] };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        await RevokeCertificate(CERT_ID);
+
+        expect(DeleteSecret).not.toHaveBeenCalled();
+        expect(DeleteCertificate).not.toHaveBeenCalled();
+        expect(UpdateLocalState).not.toHaveBeenCalled();
+        expect(SiteCertificateChanged).toHaveBeenCalledWith(SUCCESSOR_ID);
+        expect(AccessCertificateChanged).toHaveBeenCalledWith(SUCCESSOR_ID);
+        expect(mockClient.query).toHaveBeenCalledWith(
+            "SELECT 1 FROM TlsCertificates WHERE ObjectName = $1 AND Id <> $2 LIMIT 1",
+            [certRow.objectname, CERT_ID]
+        );
+        for (const table of TLS_CERTIFICATE_PARENT_TABLES) {
+            expect(mockClient.query).toHaveBeenCalledWith(parentFkSql(table), [CERT_ID]);
+        }
     });
 
     it("rejects a malformed certificate id", async () => {

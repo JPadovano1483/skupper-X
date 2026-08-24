@@ -24,6 +24,8 @@ import { Log } from "@vms/modules/log";
 import { UpdateLocalState } from "@vms/modules/state-sync";
 import { IsValidUuid } from "@vms/modules/util";
 import { ClientFromPool } from "./db.js";
+import { AccessCertificateChanged, SiteCertificateChanged } from "./sync-management.js";
+import { getCurrentCertificateId, TLS_CERTIFICATE_PARENT_TABLES } from "./tls-rotation.js";
 
 function httpError(statusCode, message) {
     const error = new Error(message);
@@ -141,6 +143,26 @@ export async function dropAccessPointCertificate(client, notify, accessId) {
     return objectNames;
 }
 
+async function objectNameHasOtherTlsRow(client, objectName, certId) {
+    const result = await client.query(
+        "SELECT 1 FROM TlsCertificates WHERE ObjectName = $1 AND Id <> $2 LIMIT 1",
+        [objectName, certId]
+    );
+    return result.rowCount > 0;
+}
+
+async function certificateHasParentFk(client, certId) {
+    for (const table of TLS_CERTIFICATE_PARENT_TABLES) {
+        const result = await client.query(`SELECT 1 FROM ${table} WHERE Certificate = $1 LIMIT 1`, [
+            certId,
+        ]);
+        if (result.rowCount > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export async function advertiseTlsRevoked(certId) {
     const client = await ClientFromPool("system");
     try {
@@ -176,6 +198,9 @@ export async function RevokeCertificate(cid, { reason = "Revoked via API", expir
 
     const client = await ClientFromPool("system");
     let cert;
+    let objectNameReferenced;
+    let hasParentFks;
+    let currentCertificateId;
     try {
         const result = await client.query(
             "SELECT id, objectname, label, isca, expiration FROM TlsCertificates WHERE id = $1",
@@ -189,13 +214,27 @@ export async function RevokeCertificate(cid, { reason = "Revoked via API", expir
             throw httpError(409, "CA certificate revocation is not supported");
         }
         await insertRevocation(client, cid, expiration ?? cert.expiration, reason);
+        objectNameReferenced = cert.objectname
+            ? await objectNameHasOtherTlsRow(client, cert.objectname, cid)
+            : false;
+        hasParentFks = await certificateHasParentFk(client, cid);
+        if (!hasParentFks && cert.objectname) {
+            currentCertificateId = await getCurrentCertificateId(client, cert.objectname);
+        }
     } finally {
         client.release();
     }
 
-    if (cert.objectname) {
+    // Generations share kube objects; only delete when this was the last TlsCertificates row.
+    if (cert.objectname && !objectNameReferenced) {
         await deleteKubeTlsObjects(cert.objectname);
     }
-    await advertiseTlsRevoked(cid);
+    if (hasParentFks) {
+        await advertiseTlsRevoked(cid);
+    } else if (currentCertificateId && currentCertificateId !== cid) {
+        // Predecessor no longer holds parent FKs; bump lastValid on the live successor.
+        await SiteCertificateChanged(currentCertificateId);
+        await AccessCertificateChanged(currentCertificateId);
+    }
     return cert;
 }
