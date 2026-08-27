@@ -206,6 +206,38 @@ export function setCertificateDnsName(cert, dnsName) {
     };
 }
 
+const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
+
+export function setCertificateIssuerRef(cert, issuerName, issuerLink) {
+    if (!cert || !issuerName) {
+        return null;
+    }
+    const currentName = cert.spec?.issuerRef?.name;
+    const currentLink = cert.spec?.secretTemplate?.annotations?.[ISSUER_LINK_ANNOTATION];
+    if (currentName === issuerName && (!issuerLink || currentLink === issuerLink)) {
+        return null;
+    }
+    return {
+        ...cert,
+        spec: {
+            ...cert.spec,
+            issuerRef: {
+                ...cert.spec?.issuerRef,
+                name: issuerName,
+                kind: cert.spec?.issuerRef?.kind || "Issuer",
+                group: cert.spec?.issuerRef?.group || "cert-manager.io",
+            },
+            secretTemplate: {
+                ...cert.spec?.secretTemplate,
+                annotations: {
+                    ...cert.spec?.secretTemplate?.annotations,
+                    ...(issuerLink ? { [ISSUER_LINK_ANNOTATION]: issuerLink } : {}),
+                },
+            },
+        },
+    };
+}
+
 export async function ReplaceCertificate(obj) {
     return await customApi.replaceNamespacedCustomObject({
         group: "cert-manager.io",

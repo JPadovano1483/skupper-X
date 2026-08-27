@@ -35,7 +35,6 @@ import { Log } from "@vms/modules/log";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
 import { ClientFromPool } from "./db.js";
 import { NotifyTransaction } from "./notify.js";
-import { refuseIfRevoked } from "./tls-revoke.js";
 import { retargetParentCertificateFks } from "./tls-rotation.js";
 
 const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
@@ -372,7 +371,6 @@ export async function rotateCaKey(oldCaId, options = {}) {
         if (!oldCert.isca) {
             throw httpError(409, "CA key rotation is only supported for certificate authorities");
         }
-        await refuseIfRevoked(client, oldCaId);
         if (!oldCert.objectname) {
             throw httpError(400, "Certificate has no Kubernetes object");
         }
