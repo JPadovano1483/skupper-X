@@ -120,7 +120,6 @@ function newCaCertificateObject(oldCert, { name, dbLink, issuerName, issuerLink 
                 },
             },
             duration: oldCert.spec?.duration || DEFAULT_CA_DURATION,
-            renewBefore: oldCert.spec?.renewBefore,
             subject: oldCert.spec?.subject,
             commonName: name,
             isCA: true,

@@ -101,7 +101,6 @@ CREATE TABLE Configuration (
     BackboneCaExpiration interval,
     DefaultCaExpiration interval,
     DefaultCertExpiration interval,
-    CertRenewBefore interval,               -- How long before expiry cert-manager should begin renewal
     SiteControllerImage text,
     CertOrganization text
 );
@@ -388,8 +387,8 @@ CREATE TABLE CertificateRequests (
 --
 -- Pre-populate the database with some test data.
 --
-INSERT INTO Configuration (Id, RootIssuer, DefaultCaExpiration, DefaultCertExpiration, CertRenewBefore, BackboneCaExpiration, SiteControllerImage, CertOrganization)
-    VALUES (0, 'vms-root', '30 days', '90 days', '30 days', '1 year', 'quay.io/skupper/vms-site-controller:latest', 'enterprise.com');
+INSERT INTO Configuration (Id, RootIssuer, DefaultCaExpiration, DefaultCertExpiration, BackboneCaExpiration, SiteControllerImage, CertOrganization)
+    VALUES (0, 'vms-root', '30 days', '90 days', '1 year', 'quay.io/skupper/vms-site-controller:latest', 'enterprise.com');
 
 INSERT INTO TargetPlatforms (ShortName, LongName) VALUES
     ('sk2',      'Kubernetes/OpenShift'),

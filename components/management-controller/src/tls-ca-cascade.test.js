@@ -379,6 +379,8 @@ describe("rotateCaKey", () => {
                 }),
             })
         );
+        const newCaCert = ApplyObject.mock.calls.find(([obj]) => obj.kind === "Certificate")[0];
+        expect(newCaCert.spec).not.toHaveProperty("renewBefore");
         expect(ApplyObject).toHaveBeenCalledWith(
             expect.objectContaining({
                 kind: "Issuer",
@@ -497,6 +499,7 @@ describe("rotateCaKey", () => {
         );
         expect(vanCertApply).toBeTruthy();
         expect(vanCertApply[0].spec.issuerRef.name).toBe(`vms-bb-ca-${NEW_CA}`);
+        expect(vanCertApply[0].spec).not.toHaveProperty("renewBefore");
         expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-leaf");
         expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-member-leaf");
         expect(result.keyRotation.children).toEqual(

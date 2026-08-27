@@ -72,7 +72,6 @@ vi.mock("./config.js", () => ({
     BackboneExpiration: vi.fn(() => ({ years: 1 })),
     DefaultCaExpiration: vi.fn(() => ({ days: 30 })),
     DefaultCertExpiration: vi.fn(() => ({ days: 7 })),
-    CertRenewBefore: vi.fn(() => ({ days: 30 })),
     SiteControllerImage: vi.fn(() => "quay.io/skupper/vms-site-controller:latest"),
     RootIssuer: vi.fn(() => "vms-root"),
     CertOrganization: vi.fn(() => "enterprise.com"),
@@ -404,51 +403,16 @@ describe("onCertificateRequestsChange", () => {
                 }),
                 spec: expect.objectContaining({
                     duration: "8760h",
-                    renewBefore: "720h",
                     privateKey: expect.not.objectContaining({ rotationPolicy: "Never" }),
                 }),
             })
         );
+        expect(ApplyObject.mock.calls[0][0].spec).not.toHaveProperty("renewBefore");
         expect(notifyEvents).toContainEqual({
             method: "update",
             table: "CertificateRequests",
             id: "cert-req-3",
         });
-    });
-
-    it("clamps renewBefore to one-third of duration when the configured window does not fit", async () => {
-        mockClient.query.mockImplementation(async (sql) => {
-            if (transactionSql(sql)) {
-                return {};
-            }
-            if (sql.includes("FROM CertificateRequests WHERE RequestTime")) {
-                return {
-                    rowCount: 1,
-                    rows: [
-                        {
-                            id: "cert-req-short",
-                            requesttype: "mgmtController",
-                            durationhours: 24,
-                        },
-                    ],
-                };
-            }
-            if (sql.includes("UPDATE CertificateRequests SET Lifecycle = 'cm_cert_created'")) {
-                return {};
-            }
-            return {};
-        });
-
-        await notificationHandlers.CertificateRequests("ADD", "cert-req-short");
-
-        expect(ApplyObject).toHaveBeenCalledWith(
-            expect.objectContaining({
-                spec: expect.objectContaining({
-                    duration: "24h",
-                    renewBefore: "8h",
-                }),
-            })
-        );
     });
 
     it("sets privateKey.rotationPolicy Never on CA Certificate CRs", async () => {
