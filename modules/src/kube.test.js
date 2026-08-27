@@ -24,6 +24,7 @@ import {
     Namespace,
     markCertificateForRenewal,
     setCertificateDnsName,
+    setCertificateIssuerRef,
 } from "./kube.js";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_STATE_ID } from "./common.js";
 
@@ -133,5 +134,45 @@ describe("kube helpers", () => {
             )
         ).toBeNull();
         expect(setCertificateDnsName({ spec: {} }, null)).toBeNull();
+    });
+
+    it("setCertificateIssuerRef updates issuerRef and issuerlink annotation", () => {
+        const updated = setCertificateIssuerRef(
+            {
+                spec: {
+                    issuerRef: { name: "vms-bb-ca-old", kind: "Issuer", group: "cert-manager.io" },
+                    secretTemplate: {
+                        annotations: { "skupper.io/vms-issuerlink": "old-ca" },
+                    },
+                },
+            },
+            "vms-bb-ca-new",
+            "new-ca"
+        );
+
+        expect(updated.spec.issuerRef).toEqual({
+            name: "vms-bb-ca-new",
+            kind: "Issuer",
+            group: "cert-manager.io",
+        });
+        expect(updated.spec.secretTemplate.annotations["skupper.io/vms-issuerlink"]).toBe("new-ca");
+    });
+
+    it("setCertificateIssuerRef returns null when issuer already matches", () => {
+        expect(
+            setCertificateIssuerRef(
+                {
+                    spec: {
+                        issuerRef: { name: "vms-bb-ca-new" },
+                        secretTemplate: {
+                            annotations: { "skupper.io/vms-issuerlink": "new-ca" },
+                        },
+                    },
+                },
+                "vms-bb-ca-new",
+                "new-ca"
+            )
+        ).toBeNull();
+        expect(setCertificateIssuerRef({ spec: {} }, null)).toBeNull();
     });
 });

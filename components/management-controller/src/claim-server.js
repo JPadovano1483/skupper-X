@@ -29,6 +29,8 @@ import {
     META_ANNOTATION_STATE_HASH,
     META_ANNOTATION_STATE_DIR,
     META_ANNOTATION_TLS_INJECT,
+    META_ANNOTATION_TLS_ORDINAL,
+    META_ANNOTATION_TLS_LAST_VALID,
     INJECT_TYPE_SITE,
     META_ANNOTATION_STATE_TYPE,
     STATE_TYPE_LINK,
@@ -40,8 +42,10 @@ import { ClientFromPool } from "./db.js";
 import { LoadSecret } from "@vms/modules/kube";
 import { DispatchMessage, AssertClaimResponseSuccess, ReponseFailure } from "@vms/modules/protocol";
 import { RegisterHandler } from "./backbone-links.js";
-import { HashOfData } from "./resource-templates.js";
+import { HashOfData, HashOfSecret } from "./resource-templates.js";
 import { NotifyTransaction } from "./notify.js";
+import { getTlsRotationMeta } from "./tls-rotation.js";
+import { overlayDualTrustCa } from "./tls-ca-cascade.js";
 
 const backbones = {}; // backboneId => {conn: AMQP-Connection, sender: anon-sender, receiver: claim-receiver}
 const memberCompletions = {}; // memberId   => {handler: completion-function, result: undefined || {}, error: undefined || ERROR }
@@ -75,20 +79,28 @@ const memberCompletion = async function (memberId) {
         // Get the member site's siteClient certificate
         //
         const secret = await LoadSecret(memberSite.objectname);
+        const tlsMeta = await getTlsRotationMeta(client, memberSite.objectname);
+        const data = await overlayDualTrustCa(client, memberSite.certificate, secret.data);
         siteClient = {
             apiVersion: "v1",
             kind: "Secret",
-            data: secret.data,
+            data: data,
             metadata: {
                 name: `vms-site-${memberId}`,
                 annotations: {
                     [META_ANNOTATION_STATE_KEY]: `tls-site-${memberId}`,
-                    [META_ANNOTATION_STATE_HASH]: HashOfData(secret.data),
                     [META_ANNOTATION_STATE_DIR]: "remote",
                     [META_ANNOTATION_TLS_INJECT]: INJECT_TYPE_SITE,
                 },
             },
         };
+        if (tlsMeta) {
+            siteClient.metadata.annotations[META_ANNOTATION_TLS_ORDINAL] = String(tlsMeta.ordinal);
+            siteClient.metadata.annotations[META_ANNOTATION_TLS_LAST_VALID] = String(
+                tlsMeta.lastValid
+            );
+        }
+        siteClient.metadata.annotations[META_ANNOTATION_STATE_HASH] = HashOfSecret(siteClient);
 
         //
         // Gather the edge-link information for the outgoingLinks
@@ -168,7 +180,11 @@ const processClaim = async function (claimId, name) {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT * FROM MemberInvitations WHERE Id = $1 AND LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
+            "SELECT MemberInvitations.*, TlsCertificates.Expiration AS certexpiration FROM MemberInvitations " +
+                "LEFT JOIN TlsCertificates ON TlsCertificates.Id = MemberInvitations.Certificate " +
+                "JOIN ApplicationNetworks ON ApplicationNetworks.Id = MemberInvitations.MemberOf " +
+                "WHERE MemberInvitations.Id = $1 AND MemberInvitations.LifeCycle != 'expired' " +
+                "AND ApplicationNetworks.LifeCycle != 'expired' AND (JoinDeadline IS NULL OR JoinDeadline > now())",
             [claimId]
         );
         if (result.rowCount != 1) {
@@ -176,9 +192,18 @@ const processClaim = async function (claimId, name) {
         }
 
         //
-        // Reject the claim if the instance limit has already been reached
+        // Reject the claim if the invitation certificate is past its expiration
         //
         const claim = result.rows[0];
+        if (claim.certificate) {
+            if (claim.certexpiration && new Date(claim.certexpiration) <= new Date()) {
+                throw new Error("Invitation certificate has expired");
+            }
+        }
+
+        //
+        // Reject the claim if the instance limit has already been reached
+        //
         if (claim.instancelimit && claim.instancecount == claim.instancelimit) {
             throw new Error("Instance limit on this claim has been reached");
         }

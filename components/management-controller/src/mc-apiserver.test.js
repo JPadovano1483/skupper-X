@@ -293,7 +293,32 @@ describe("mc-apiserver routes", () => {
             .set("x-test-auth", "1")
             .expect(202);
 
-        expect(RotateCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert);
+        expect(RotateCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert, { rotateKey: false });
+        expect(res.body).toEqual(cert);
+    });
+
+    it("POST /certs/:cid/rotate?rotateKey=true forwards rotateKey", async () => {
+        const cert = {
+            id: TEST_UUIDS.cert,
+            objectname: "vms-bb-ca-1",
+            label: "backbone-ca",
+            isca: true,
+            keyRotation: { newCertificateId: "new-ca", children: [] },
+        };
+        RotateCertificate.mockResolvedValue(cert);
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        const res = await request(app)
+            .post(`/api/v1alpha1/certs/${TEST_UUIDS.cert}/rotate?rotateKey=true`)
+            .set("x-test-auth", "1")
+            .expect(202);
+
+        expect(RotateCertificate).toHaveBeenCalledWith(TEST_UUIDS.cert, { rotateKey: true });
         expect(res.body).toEqual(cert);
     });
 
