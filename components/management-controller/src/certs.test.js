@@ -35,6 +35,23 @@ vi.mock("@vms/modules/kube", () => ({
     ApplyObject: vi.fn(),
     LoadCertificate: vi.fn(),
     TriggerCertificateRenewal: vi.fn(),
+    ReplaceCertificate: vi.fn(),
+    setCertificateDnsName: vi.fn((cert, dnsName) => {
+        if (!dnsName) {
+            return null;
+        }
+        const current = cert.spec?.dnsNames;
+        if (Array.isArray(current) && current.length === 1 && current[0] === dnsName) {
+            return null;
+        }
+        return {
+            ...cert,
+            spec: {
+                ...cert.spec,
+                dnsNames: [dnsName],
+            },
+        };
+    }),
     WatchSecrets: vi.fn((handler) => {
         secretWatchHandler = handler;
     }),
@@ -106,7 +123,13 @@ vi.mock("./notify.js", () => ({
 
 import { Start, RotateCertificate } from "./certs.js";
 import { RegisterNotification } from "./notify.js";
-import { ApplyObject, LoadCertificate, TriggerCertificateRenewal } from "@vms/modules/kube";
+import {
+    ApplyObject,
+    LoadCertificate,
+    TriggerCertificateRenewal,
+    ReplaceCertificate,
+    setCertificateDnsName,
+} from "@vms/modules/kube";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
 
 function transactionSql(sql) {
@@ -677,16 +700,24 @@ describe("RotateCertificate", () => {
         isca: false,
         expiration: "2026-10-12T12:00:00.000Z",
         renewaltime: "2026-10-11T12:00:00.000Z",
-        generation: 1,
+        rotationordinal: 1,
     };
 
     beforeEach(() => {
         vi.clearAllMocks();
         mockClient.query.mockReset();
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
     });
 
     it("triggers cert-manager renewal for a leaf certificate", async () => {
-        mockClient.query.mockResolvedValue({ rowCount: 1, rows: [certRow] });
         TriggerCertificateRenewal.mockResolvedValue({});
 
         await expect(RotateCertificate(certId)).resolves.toEqual(certRow);
@@ -732,9 +763,11 @@ describe("RotateCertificate", () => {
     });
 
     it("rejects a certificate with no Kubernetes object name", async () => {
-        mockClient.query.mockResolvedValue({
-            rowCount: 1,
-            rows: [{ ...certRow, objectname: null }],
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            return { rowCount: 1, rows: [{ ...certRow, objectname: null }] };
         });
 
         await expect(RotateCertificate(certId)).rejects.toMatchObject({
@@ -744,8 +777,22 @@ describe("RotateCertificate", () => {
         expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
     });
 
+    it("refuses rotation of a revoked certificate", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 1, rows: [{}] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
+
+        await expect(RotateCertificate(certId)).rejects.toMatchObject({
+            statusCode: 409,
+            message: "Certificate has been revoked",
+        });
+        expect(TriggerCertificateRenewal).not.toHaveBeenCalled();
+    });
+
     it("maps a missing Certificate CR to 404", async () => {
-        mockClient.query.mockResolvedValue({ rowCount: 1, rows: [certRow] });
         const missing = new Error("not found");
         missing.statusCode = 404;
         TriggerCertificateRenewal.mockRejectedValue(missing);
@@ -754,5 +801,61 @@ describe("RotateCertificate", () => {
             statusCode: 404,
             message: "Certificate object vms-interior-cert-1 not found",
         });
+    });
+
+    it("updates Certificate dnsNames to the current access-point hostname before renew", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 1, rows: [{ hostname: "new.example.com" }] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-interior-cert-1" },
+            spec: { dnsNames: ["old.example.com"] },
+        });
+        setCertificateDnsName.mockReturnValue({
+            metadata: { name: "vms-interior-cert-1" },
+            spec: { dnsNames: ["new.example.com"] },
+        });
+        TriggerCertificateRenewal.mockResolvedValue({});
+
+        await RotateCertificate(certId);
+
+        expect(LoadCertificate).toHaveBeenCalledWith("vms-interior-cert-1");
+        expect(setCertificateDnsName).toHaveBeenCalledWith(
+            expect.objectContaining({ spec: { dnsNames: ["old.example.com"] } }),
+            "new.example.com"
+        );
+        expect(ReplaceCertificate).toHaveBeenCalledWith(
+            expect.objectContaining({ spec: { dnsNames: ["new.example.com"] } })
+        );
+        expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
+    });
+
+    it("does not replace the Certificate CR when dnsNames already match", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("FROM TlsClientRevocations")) {
+                return { rowCount: 0, rows: [] };
+            }
+            if (sql.includes("FROM BackboneAccessPoints")) {
+                return { rowCount: 1, rows: [{ hostname: "router.example.com" }] };
+            }
+            return { rowCount: 1, rows: [certRow] };
+        });
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-interior-cert-1" },
+            spec: { dnsNames: ["router.example.com"] },
+        });
+        setCertificateDnsName.mockReturnValue(null);
+        TriggerCertificateRenewal.mockResolvedValue({});
+
+        await RotateCertificate(certId);
+
+        expect(ReplaceCertificate).not.toHaveBeenCalled();
+        expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
     });
 });

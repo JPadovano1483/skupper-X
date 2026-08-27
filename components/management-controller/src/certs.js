@@ -23,6 +23,8 @@ import {
     ApplyObject,
     LoadCertificate,
     TriggerCertificateRenewal,
+    ReplaceCertificate,
+    setCertificateDnsName,
     WatchSecrets,
     WatchCertificates,
     GetIssuers,
@@ -40,6 +42,7 @@ import {
     CertOrganization,
 } from "./config.js";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
+import { refuseIfRevoked } from "./tls-revoke.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
@@ -987,6 +990,21 @@ function kubeStatusCode(err) {
     return err?.statusCode || err?.code || err?.response?.statusCode;
 }
 
+async function syncAccessPointDnsNames(client, certId, objectName) {
+    const apResult = await client.query(
+        "SELECT Hostname FROM BackboneAccessPoints WHERE Certificate = $1 AND Hostname IS NOT NULL",
+        [certId]
+    );
+    if (apResult.rowCount != 1) {
+        return;
+    }
+    const kubeCert = await LoadCertificate(objectName);
+    const updated = setCertificateDnsName(kubeCert, apResult.rows[0].hostname);
+    if (updated) {
+        await ReplaceCertificate(updated);
+    }
+}
+
 //
 // Force in-place cert-manager renewal for an existing TlsCertificates row.
 // Does not insert CertificateRequests — that would create a differently
@@ -1000,7 +1018,7 @@ export async function RotateCertificate(cid) {
     const client = await ClientFromPool("system");
     try {
         const result = await client.query(
-            "SELECT id, objectname, label, isca, expiration, renewaltime, generation FROM tlsCertificates WHERE id = $1",
+            "SELECT id, objectname, label, isca, expiration, renewaltime, rotationordinal FROM tlsCertificates WHERE id = $1",
             [cid]
         );
         if (result.rowCount == 0) {
@@ -1010,11 +1028,13 @@ export async function RotateCertificate(cid) {
         if (cert.isca) {
             throw httpError(409, "CA certificate rotation is not supported");
         }
+        await refuseIfRevoked(client, cid);
         if (!cert.objectname) {
             throw httpError(400, "Certificate has no Kubernetes object");
         }
         Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
         try {
+            await syncAccessPointDnsNames(client, cid, cert.objectname);
             await TriggerCertificateRenewal(cert.objectname);
         } catch (err) {
             if (kubeStatusCode(err) == 404) {
