@@ -188,16 +188,7 @@ async function onAccessPointsChange(action, id) {
         if (result.rowCount == 1) {
             const row = result.rows[0];
             Log(`New Backbone Access Point: ${row.name}`);
-            let duration_ms;
-
-            if (row.endtime) {
-                duration_ms =
-                    row.endtime.getTime() -
-                    row.starttime.getTime() +
-                    IntervalMilliseconds(row.deletedelay);
-            } else {
-                duration_ms = IntervalMilliseconds(DefaultCaExpiration());
-            }
+            const duration_ms = IntervalMilliseconds(DefaultCertExpiration());
             const cert = await client.query(
                 "INSERT INTO CertificateRequests(Id, RequestType, CreatedTime, RequestTime, DurationHours, AccessPoint, Issuer, Hostname) " +
                     "VALUES(gen_random_uuid(), 'accessPoint', now(), now(), $1, $2, $3, $4) Returning Id",
