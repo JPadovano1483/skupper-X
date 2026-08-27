@@ -25,6 +25,8 @@ import {
     META_ANNOTATION_STATE_HASH,
     META_ANNOTATION_STATE_KEY,
     META_ANNOTATION_STATE_DIR,
+    META_ANNOTATION_TLS_ORDINAL,
+    META_ANNOTATION_TLS_LAST_VALID,
 } from "@vms/modules/common";
 
 /** @type {Record<string, Function>} */
@@ -285,6 +287,8 @@ describe("onStateChange", () => {
         const newSecretData = {
             "tls.crt": "new-cert",
             "tls.key": "new-key",
+            ordinal: "1",
+            lastValid: "0",
         };
 
         await stateSyncCallbacks.onStateChange(
@@ -306,9 +310,14 @@ describe("onStateChange", () => {
                         [META_ANNOTATION_STATE_HASH]: "new-hash",
                         [META_ANNOTATION_STATE_KEY]: "tls-site-site-1",
                         [META_ANNOTATION_TLS_INJECT]: INJECT_TYPE_SITE,
+                        [META_ANNOTATION_TLS_ORDINAL]: "1",
+                        [META_ANNOTATION_TLS_LAST_VALID]: "0",
                     }),
                 }),
-                data: newSecretData,
+                data: {
+                    "tls.crt": "new-cert",
+                    "tls.key": "new-key",
+                },
             })
         );
         expect(ApplyObject).not.toHaveBeenCalled();

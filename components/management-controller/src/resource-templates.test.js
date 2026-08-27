@@ -27,6 +27,8 @@ import {
     HashOfData,
     HashOfConfigMap,
     HashOfObjectNoChildren,
+    HashOfSecret,
+    Secret,
     BackboneSite,
     NetworkCR,
     NetworkLinkCR,
@@ -50,6 +52,40 @@ describe("resource-templates", () => {
     it("HashOfObjectNoChildren ignores nested objects", () => {
         const hash = HashOfObjectNoChildren({ name: "site", spec: { nested: true } });
         expect(hash).toBe(HashOfData({ name: "site" }));
+    });
+
+    it("HashOfSecret includes tls ordinal annotations in the hash", () => {
+        const data = { "tls.crt": "cert", "tls.key": "key" };
+        const withoutMeta = HashOfSecret({ data });
+        const withMeta = HashOfSecret({
+            data,
+            metadata: {
+                annotations: {
+                    "vms/tls-ordinal": "1",
+                    "vms/tls-last-valid": "0",
+                },
+            },
+        });
+        expect(withMeta).not.toBe(withoutMeta);
+        expect(withMeta).toBe(HashOfData({ ...data, ordinal: "1", lastValid: "0" }));
+    });
+
+    it("Secret annotates distributed TLS profiles with ordinal and lastValid", () => {
+        const secret = Secret(
+            { data: { "tls.crt": "cert", "tls.key": "key" } },
+            "vms-site-1",
+            "site",
+            "tls-site-1",
+            { ordinal: 1, lastValid: 0 }
+        );
+        expect(secret.metadata.annotations["vms/tls-ordinal"]).toBe("1");
+        expect(secret.metadata.annotations["vms/tls-last-valid"]).toBe("0");
+        expect(secret.metadata.annotations["vms/state-hash"]).toBe(
+            HashOfSecret({
+                data: secret.data,
+                metadata: { annotations: secret.metadata.annotations },
+            })
+        );
     });
 
     it("BackboneSite produces expected CR shape", () => {

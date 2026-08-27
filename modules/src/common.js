@@ -39,6 +39,9 @@ export const META_ANNOTATION_STATE_DIR = "vms/state-dir";
 export const META_ANNOTATION_STATE_TYPE = "vms/state-type";
 export const META_ANNOTATION_STATE_ID = "vms/state-id";
 export const META_ANNOTATION_TLS_INJECT = "vms/tls-inject";
+export const META_ANNOTATION_TLS_ORDINAL = "vms/tls-ordinal";
+export const META_ANNOTATION_TLS_LAST_VALID = "vms/tls-last-valid";
+export const META_ANNOTATION_VMS_DBLINK = "skupper.io/vms-dblink";
 
 //
 // State types

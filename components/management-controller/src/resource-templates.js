@@ -27,6 +27,8 @@ import {
     META_ANNOTATION_STATE_DIR,
     META_ANNOTATION_STATE_KEY,
     META_ANNOTATION_STATE_HASH,
+    META_ANNOTATION_TLS_ORDINAL,
+    META_ANNOTATION_TLS_LAST_VALID,
     STATE_TYPE_LINK,
 } from "@vms/modules/common";
 import { createHash } from "node:crypto";
@@ -51,8 +53,28 @@ export function HashOfData(data) {
     return createHash("sha1").update(text).digest("hex");
 }
 
+export function tlsSyncData(secretData, tlsMeta) {
+    if (tlsMeta?.ordinal === undefined || tlsMeta.ordinal === null) {
+        return secretData;
+    }
+    return {
+        ...secretData,
+        ordinal: String(tlsMeta.ordinal),
+        lastValid: String(tlsMeta.lastValid),
+    };
+}
+
+export function HashOfTlsPayload(secretData, tlsMeta) {
+    return HashOfData(tlsSyncData(secretData, tlsMeta));
+}
+
 export function HashOfSecret(secret) {
-    return HashOfData(secret.data);
+    const ordinal = secret.metadata?.annotations?.[META_ANNOTATION_TLS_ORDINAL];
+    const lastValid = secret.metadata?.annotations?.[META_ANNOTATION_TLS_LAST_VALID];
+    if (ordinal === undefined) {
+        return HashOfData(secret.data);
+    }
+    return HashOfTlsPayload(secret.data, { ordinal, lastValid });
 }
 
 export function HashOfConfigMap(cm) {
@@ -296,7 +318,7 @@ export function InterNetworkIngressCR(name, routingKey, networkLink = "", networ
     return ingress;
 }
 
-export function Secret(certificate, profile_name, inject, stateKey) {
+export function Secret(certificate, profile_name, inject, stateKey, tlsMeta) {
     const secret = {
         apiVersion: "v1",
         kind: "Secret",
@@ -312,6 +334,10 @@ export function Secret(certificate, profile_name, inject, stateKey) {
 
     if (inject) {
         secret.metadata.annotations[META_ANNOTATION_TLS_INJECT] = inject;
+    }
+    if (tlsMeta?.ordinal !== undefined && tlsMeta.ordinal !== null) {
+        secret.metadata.annotations[META_ANNOTATION_TLS_ORDINAL] = String(tlsMeta.ordinal);
+        secret.metadata.annotations[META_ANNOTATION_TLS_LAST_VALID] = String(tlsMeta.lastValid);
     }
     if (stateKey) {
         secret.metadata.annotations[META_ANNOTATION_STATE_DIR] = "remote";
