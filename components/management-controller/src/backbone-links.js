@@ -26,8 +26,10 @@
 import { LoadSecret } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
 import { ClientFromPool } from "./db.js";
-import { OpenConnection, CloseConnection } from "@vms/modules/amqp";
+import { OpenConnection, CloseConnection, OnConnectionClosed } from "@vms/modules/amqp";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
+
+const UNEXPECTED_RECONNECT_DELAY_MS = 1000;
 
 let controller_name;
 let controller_certificate_id;
@@ -37,16 +39,27 @@ let tls_key;
 const manageConnections = {};
 const registrations = [];
 
+function connectionNeedsRefresh(existing, row) {
+    return (
+        existing.host !== row.hostname ||
+        String(existing.port) !== String(row.port) ||
+        existing.certificate !== row.certificate
+    );
+}
+
 async function createConnection(apid, row) {
-    manageConnections[apid] = {
+    const rec = {
         toDelete: false,
+        closing: false,
         host: row.hostname,
         port: row.port,
+        certificate: row.certificate,
         colocated: row.colocated,
     };
+    manageConnections[apid] = rec;
 
     Log(`Connecting to Access Point: ${row.hostname}:${row.port}`);
-    manageConnections[apid].conn = OpenConnection(
+    rec.conn = OpenConnection(
         `Backbone-management-${apid}`,
         row.hostname,
         row.port,
@@ -55,23 +68,43 @@ async function createConnection(apid, row) {
         tls_cert,
         tls_key
     );
+    OnConnectionClosed(rec.conn, () => {
+        void onManageConnectionClosed(apid, rec.conn);
+    });
 
     for (const reg of registrations) {
-        await reg.onLinkAdded(apid, manageConnections[apid].conn, {
-            colocated: manageConnections[apid].colocated,
+        await reg.onLinkAdded(apid, rec.conn, {
+            colocated: rec.colocated,
         });
     }
 }
 
 async function deleteConnection(apid) {
-    const conn = manageConnections[apid].conn;
-    const colocated = manageConnections[apid].colocated;
+    const rec = manageConnections[apid];
+    if (!rec) {
+        return;
+    }
+    rec.closing = true;
+    const conn = rec.conn;
+    const colocated = rec.colocated;
     CloseConnection(conn);
     delete manageConnections[apid];
 
     for (const reg of registrations) {
         await reg.onLinkDeleted(apid, { colocated: colocated });
     }
+}
+
+async function onManageConnectionClosed(apid, conn) {
+    const rec = manageConnections[apid];
+    if (!rec || rec.closing || rec.conn !== conn) {
+        return;
+    }
+    Log(`Manage AMQP connection to access point ${apid} closed, reconnecting`);
+    await deleteConnection(apid);
+    setTimeout(() => {
+        void reconcileBackboneConnections();
+    }, UNEXPECTED_RECONNECT_DELAY_MS);
 }
 
 async function periodicCheck() {
@@ -86,7 +119,8 @@ async function reconcileBackboneConnections() {
     try {
         await client.query("BEGIN");
         const result = await client.query(
-            "SELECT *, InteriorSites.CoLocated FROM BackboneAccessPoints AS ap " +
+            "SELECT ap.Id, ap.Hostname, ap.Port, ap.Certificate, InteriorSites.CoLocated " +
+                "FROM BackboneAccessPoints AS ap " +
                 "JOIN InteriorSites ON InteriorSites.Id = ap.InteriorSite " +
                 "WHERE ap.Lifecycle = 'ready' AND ap.Kind = 'manage'"
         );
@@ -96,8 +130,17 @@ async function reconcileBackboneConnections() {
         }
 
         for (const row of result.rows) {
-            if (manageConnections[row.id]) {
-                manageConnections[row.id].toDelete = false;
+            const existing = manageConnections[row.id];
+            if (existing && connectionNeedsRefresh(existing, row)) {
+                Log(`Manage access point ${row.id} TLS or endpoint changed, reconnecting AMQP`);
+                await deleteConnection(row.id);
+                try {
+                    await createConnection(row.id, row);
+                } catch (error) {
+                    Log(`Failed to reconnect to manage access point ${row.id}: ${error.message}`);
+                }
+            } else if (existing) {
+                existing.toDelete = false;
             } else {
                 // Fire and forget individual connection promises to prevent a single
                 // failure from blocking subsequent access points.

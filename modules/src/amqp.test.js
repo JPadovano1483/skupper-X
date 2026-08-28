@@ -33,6 +33,8 @@ describe("amqp", () => {
         vi.resetModules();
 
         mockAmqpConnection = {
+            options: {},
+            on: vi.fn(),
             open_receiver: vi.fn(),
             open_sender: vi.fn(() => ({
                 send: vi.fn((message) => sentMessages.push(message)),
@@ -98,5 +100,32 @@ describe("amqp", () => {
         CloseConnection(conn);
 
         expect(mockAmqpConnection.close).toHaveBeenCalled();
+    });
+
+    it("OnConnectionClosed disables reconnect and notifies once", async () => {
+        const { OpenConnection, OnConnectionClosed } = await import("./amqp.js");
+        const conn = OpenConnection("test-conn", "localhost", 5672);
+        const handler = vi.fn();
+
+        OnConnectionClosed(conn, handler);
+
+        expect(mockAmqpConnection.options.reconnect).toBe(false);
+        expect(mockAmqpConnection.on).toHaveBeenCalledWith("disconnected", expect.any(Function));
+        expect(mockAmqpConnection.on).toHaveBeenCalledWith(
+            "connection_close",
+            expect.any(Function)
+        );
+
+        const disconnected = mockAmqpConnection.on.mock.calls.find(
+            (call) => call[0] === "disconnected"
+        )[1];
+        const connectionClose = mockAmqpConnection.on.mock.calls.find(
+            (call) => call[0] === "connection_close"
+        )[1];
+        disconnected();
+        connectionClose();
+
+        expect(handler).toHaveBeenCalledTimes(1);
+        expect(handler).toHaveBeenCalledWith(conn);
     });
 });

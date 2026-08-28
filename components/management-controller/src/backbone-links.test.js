@@ -31,6 +31,7 @@ vi.mock("@vms/modules/kube", () => ({
 vi.mock("@vms/modules/amqp", () => ({
     OpenConnection: vi.fn(() => ({ id: "mock-conn" })),
     CloseConnection: vi.fn(),
+    OnConnectionClosed: vi.fn(),
 }));
 
 vi.mock("./db.js", () => ({
@@ -46,7 +47,7 @@ vi.mock("./notify.js", () => ({
 }));
 
 import { LoadSecret } from "@vms/modules/kube";
-import { OpenConnection, CloseConnection } from "@vms/modules/amqp";
+import { OpenConnection, CloseConnection, OnConnectionClosed } from "@vms/modules/amqp";
 import { RegisterNotification } from "./notify.js";
 
 const notificationHandlers = {};
@@ -80,6 +81,7 @@ function mockReadyControllerQueries(overrides = {}) {
                         id: "ap-1",
                         hostname: "router.example.com",
                         port: 5671,
+                        certificate: "ap-cert-1",
                         colocated: false,
                     },
                 ],
@@ -352,5 +354,187 @@ describe("onTlsCertificateChange (via Start)", () => {
         expect(CloseConnection).not.toHaveBeenCalled();
         expect(LoadSecret).not.toHaveBeenCalled();
         expect(OpenConnection).not.toHaveBeenCalled();
+    });
+});
+
+async function startConnectedController(Start) {
+    LoadSecret.mockResolvedValue({
+        data: {
+            "ca.crt": Buffer.from("ca").toString("base64"),
+            "tls.crt": Buffer.from("cert").toString("base64"),
+            "tls.key": Buffer.from("key").toString("base64"),
+        },
+    });
+    mockClient.query.mockImplementation(mockReadyControllerQueries());
+    await Start("test-controller");
+    await vi.runOnlyPendingTimersAsync();
+    await vi.runOnlyPendingTimersAsync();
+}
+
+describe("onAccessPointChange (via Start)", () => {
+    let Start;
+
+    beforeEach(async () => {
+        vi.useFakeTimers();
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        for (const key of Object.keys(notificationHandlers)) {
+            delete notificationHandlers[key];
+        }
+        captureNotificationHandlers();
+        vi.resetModules();
+        ({ Start } = await import("./backbone-links.js"));
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it("reconnects manage AMQP when the access point certificate changes", async () => {
+        await startConnectedController(Start);
+        expect(OpenConnection).toHaveBeenCalledTimes(1);
+        CloseConnection.mockClear();
+        OpenConnection.mockClear();
+
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("BackboneAccessPoints AS ap")) {
+                return {
+                    rows: [
+                        {
+                            id: "ap-1",
+                            hostname: "router.example.com",
+                            port: 5671,
+                            certificate: "ap-cert-2",
+                            colocated: false,
+                        },
+                    ],
+                };
+            }
+            return mockReadyControllerQueries()(sql);
+        });
+
+        await notificationHandlers.BackboneAccessPoints("UPDATE", "ap-1");
+
+        expect(CloseConnection).toHaveBeenCalledWith({ id: "mock-conn" });
+        expect(OpenConnection).toHaveBeenCalledWith(
+            "Backbone-management-ap-1",
+            "router.example.com",
+            5671,
+            "tls",
+            expect.any(Buffer),
+            expect.any(Buffer),
+            expect.any(Buffer)
+        );
+    });
+
+    it("reconnects manage AMQP when the access point endpoint changes", async () => {
+        await startConnectedController(Start);
+        CloseConnection.mockClear();
+        OpenConnection.mockClear();
+
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql.includes("BackboneAccessPoints AS ap")) {
+                return {
+                    rows: [
+                        {
+                            id: "ap-1",
+                            hostname: "router-new.example.com",
+                            port: 5671,
+                            certificate: "ap-cert-1",
+                            colocated: false,
+                        },
+                    ],
+                };
+            }
+            return mockReadyControllerQueries()(sql);
+        });
+
+        await notificationHandlers.BackboneAccessPoints("UPDATE", "ap-1");
+
+        expect(CloseConnection).toHaveBeenCalledTimes(1);
+        expect(OpenConnection).toHaveBeenCalledWith(
+            "Backbone-management-ap-1",
+            "router-new.example.com",
+            5671,
+            "tls",
+            expect.any(Buffer),
+            expect.any(Buffer),
+            expect.any(Buffer)
+        );
+    });
+
+    it("does not reconnect when the access point is unchanged", async () => {
+        await startConnectedController(Start);
+        CloseConnection.mockClear();
+        OpenConnection.mockClear();
+
+        await notificationHandlers.BackboneAccessPoints("UPDATE", "ap-1");
+
+        expect(CloseConnection).not.toHaveBeenCalled();
+        expect(OpenConnection).not.toHaveBeenCalled();
+    });
+});
+
+describe("unexpected manage AMQP close (via Start)", () => {
+    let Start;
+
+    beforeEach(async () => {
+        vi.useFakeTimers();
+        vi.clearAllMocks();
+        mockClient.query.mockReset();
+        for (const key of Object.keys(notificationHandlers)) {
+            delete notificationHandlers[key];
+        }
+        captureNotificationHandlers();
+        vi.resetModules();
+        ({ Start } = await import("./backbone-links.js"));
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it("reconnects after the router closes the manage AMQP session", async () => {
+        const closedHandlers = [];
+        OnConnectionClosed.mockImplementation((_conn, handler) => {
+            closedHandlers.push(handler);
+        });
+
+        await startConnectedController(Start);
+        expect(closedHandlers).toHaveLength(1);
+        CloseConnection.mockClear();
+        OpenConnection.mockClear();
+
+        await closedHandlers[0]();
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(CloseConnection).toHaveBeenCalledWith({ id: "mock-conn" });
+        expect(OpenConnection).toHaveBeenCalledWith(
+            "Backbone-management-ap-1",
+            "router.example.com",
+            5671,
+            "tls",
+            expect.any(Buffer),
+            expect.any(Buffer),
+            expect.any(Buffer)
+        );
+    });
+
+    it("does not reconnect from a stale close after an intentional reload", async () => {
+        const closedHandlers = [];
+        OnConnectionClosed.mockImplementation((_conn, handler) => {
+            closedHandlers.push(handler);
+        });
+
+        await startConnectedController(Start);
+        const staleClose = closedHandlers[0];
+        OpenConnection.mockClear();
+
+        await notificationHandlers.TlsCertificates("UPDATE", "cert-1");
+
+        expect(OpenConnection).toHaveBeenCalledTimes(1);
+        await staleClose();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(OpenConnection).toHaveBeenCalledTimes(1);
     });
 });
