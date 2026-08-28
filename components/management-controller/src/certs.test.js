@@ -149,6 +149,10 @@ function transactionSql(sql) {
     return sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK";
 }
 
+function isLatestCertLockSql(sql) {
+    return sql.includes("FOR UPDATE") && sql.includes("ORDER BY RotationOrdinal DESC");
+}
+
 describe("certs Start", () => {
     beforeEach(() => {
         vi.clearAllMocks();
@@ -719,11 +723,8 @@ describe("onSecretWatch", () => {
             if (transactionSql(sql)) {
                 return {};
             }
-            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+            if (isLatestCertLockSql(sql)) {
                 return { rowCount: 1, rows: [oldCert] };
-            }
-            if (sql.includes("WHERE Supercedes = $1")) {
-                return { rowCount: 0, rows: [] };
             }
             if (sql.includes("INSERT INTO TlsCertificates")) {
                 return { rows: [{ id: "cert-2" }] };
@@ -787,11 +788,8 @@ describe("onSecretWatch", () => {
             if (transactionSql(sql)) {
                 return {};
             }
-            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+            if (isLatestCertLockSql(sql)) {
                 return { rowCount: 1, rows: [oldCert] };
-            }
-            if (sql.includes("WHERE Supercedes = $1")) {
-                return { rowCount: 0, rows: [] };
             }
             return { rowCount: 0, rows: [] };
         });
@@ -799,16 +797,16 @@ describe("onSecretWatch", () => {
         secretWatchHandler("MODIFIED", modifiedSecret("101"));
 
         await vi.waitFor(() => {
-            expect(mockClient.query).toHaveBeenCalledWith(
-                expect.stringContaining("SELECT Id, IsCA, ObjectName"),
-                ["cert-1", "vms-interior-cert-1"]
-            );
+            expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("FOR UPDATE"), [
+                "vms-interior-cert-1",
+            ]);
         });
         expect(mockClient.query).not.toHaveBeenCalledWith(
             expect.stringContaining("INSERT INTO TlsCertificates"),
             expect.anything()
         );
-        expect(SiteCertificateChanged).not.toHaveBeenCalled();
+        expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-1");
+        expect(AccessCertificateChanged).toHaveBeenCalledWith("cert-1");
     });
 
     it("uses the secret issuerlink as SignedBy when the leaf is re-issued under a new CA", async () => {
@@ -825,11 +823,8 @@ describe("onSecretWatch", () => {
             if (transactionSql(sql)) {
                 return {};
             }
-            if (sql.includes("SELECT Id, IsCA, ObjectName")) {
+            if (isLatestCertLockSql(sql)) {
                 return { rowCount: 1, rows: [oldCert] };
-            }
-            if (sql.includes("WHERE Supercedes = $1")) {
-                return { rowCount: 0, rows: [] };
             }
             if (sql.includes("INSERT INTO TlsCertificates")) {
                 return { rows: [{ id: "cert-2" }] };
@@ -862,6 +857,105 @@ describe("onSecretWatch", () => {
             ])
         );
         expect(certIdsToRefreshAfterIssuerCutover).toHaveBeenCalledWith("new-ca", oldCert.signedby);
+    });
+
+    it("inserts the next generation when dblink still points at a superseded row", async () => {
+        const latestCert = {
+            ...oldCert,
+            id: "cert-2",
+            rotationordinal: 1,
+            expiration: new Date("2026-10-12T12:00:00.000Z"),
+            renewaltime: new Date("2026-10-11T12:00:00.000Z"),
+        };
+        LoadCertificate.mockResolvedValue({
+            metadata: {
+                name: "vms-interior-cert-1",
+                annotations: { "skupper.io/vms-dblink": "cert-1" },
+            },
+            spec: { secretTemplate: { annotations: { "skupper.io/vms-dblink": "cert-1" } } },
+            status: {
+                notAfter: "2026-11-12T12:00:00.000Z",
+                renewalTime: "2026-11-11T12:00:00.000Z",
+            },
+        });
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (isLatestCertLockSql(sql)) {
+                return { rowCount: 1, rows: [latestCert] };
+            }
+            if (sql.includes("INSERT INTO TlsCertificates")) {
+                return { rows: [{ id: "cert-3" }] };
+            }
+            if (sql.includes("SET Certificate = $1 WHERE Certificate = $2")) {
+                return { rows: sql.includes("InteriorSites") ? [{ id: "site-1" }] : [] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        secretWatchHandler("MODIFIED", modifiedSecret("103"));
+
+        await vi.waitFor(() => {
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-3");
+        });
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("INSERT INTO TlsCertificates"),
+            expect.arrayContaining([
+                latestCert.isca,
+                latestCert.objectname,
+                latestCert.signedby,
+                expect.any(Date),
+                expect.any(Date),
+                2,
+                latestCert.id,
+                latestCert.label,
+            ])
+        );
+        expect(mockClient.query).not.toHaveBeenCalledWith("ROLLBACK");
+    });
+
+    it("keeps the new generation when retargeting the Certificate CR hits a 409", async () => {
+        const conflict = new Error(
+            'HTTP-Code: 409\nMessage: Unknown API Status Code!\nBody: {"reason":"Conflict"}'
+        );
+        LoadCertificate.mockImplementation(async () => ({
+            metadata: { name: "vms-interior-cert-1", annotations: {} },
+            spec: { secretTemplate: { annotations: {} } },
+            status: {
+                notAfter: "2026-10-12T12:00:00.000Z",
+                renewalTime: "2026-10-11T12:00:00.000Z",
+            },
+        }));
+        ReplaceCertificate.mockRejectedValueOnce(conflict).mockResolvedValue({});
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (isLatestCertLockSql(sql)) {
+                return { rowCount: 1, rows: [oldCert] };
+            }
+            if (sql.includes("INSERT INTO TlsCertificates")) {
+                return { rows: [{ id: "cert-2" }] };
+            }
+            if (sql.includes("SET Certificate = $1 WHERE Certificate = $2")) {
+                return { rows: [] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        secretWatchHandler("MODIFIED", modifiedSecret("104"));
+
+        await vi.waitFor(() => {
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("cert-2");
+        });
+        expect(mockClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("INSERT INTO TlsCertificates"),
+            expect.anything()
+        );
+        expect(mockClient.query).not.toHaveBeenCalledWith("ROLLBACK");
+        expect(ReplaceCertificate).toHaveBeenCalledTimes(2);
+        expect(ReplaceSecret).toHaveBeenCalled();
     });
 });
 

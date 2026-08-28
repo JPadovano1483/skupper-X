@@ -70,6 +70,7 @@ export async function Start() {
     await RegisterNotification("Backbones", onBackboneChange, true);
     await RegisterNotification("InteriorSites", onSiteChange, false);
     await RegisterNotification("BackboneAccessPoints", onAccessPointChange, false);
+    await RegisterNotification("TlsCertificates", onTlsCertificateChange, false);
 
     setTimeout(visitIncompleteSites, 5000);
 }
@@ -129,6 +130,36 @@ async function onAccessPointChange(action, apid) {
             coloNamespaces[ns].accesspoint = null;
             coloNamespaces[ns].deleting = true;
             await visitNamespace(ns);
+        }
+    }
+}
+
+async function onTlsCertificateChange(action, certId) {
+    if (action !== "ADD" && action !== "UPDATE") {
+        return;
+    }
+    const client = await ClientFromPool("system");
+    let siteIds;
+    try {
+        const result = await client.query(
+            "SELECT InteriorSites.Id AS id FROM InteriorSites " +
+                "WHERE InteriorSites.CoLocated = true AND InteriorSites.Certificate = $1 " +
+                "UNION " +
+                "SELECT BackboneAccessPoints.InteriorSite AS id FROM BackboneAccessPoints " +
+                "JOIN InteriorSites ON InteriorSites.Id = BackboneAccessPoints.InteriorSite " +
+                "WHERE InteriorSites.CoLocated = true AND BackboneAccessPoints.Certificate = $1",
+            [certId]
+        );
+        siteIds = result.rows.map((row) => row.id);
+    } finally {
+        client.release();
+    }
+    for (const siteId of siteIds || []) {
+        await onSiteChange("UPDATE", siteId);
+        const ns = siteIndex[siteId];
+        const apId = ns ? coloNamespaces[ns]?.accesspoint?.id : undefined;
+        if (apId) {
+            await onAccessPointChange("UPDATE", apId);
         }
     }
 }

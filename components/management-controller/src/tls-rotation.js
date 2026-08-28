@@ -83,6 +83,18 @@ export async function getCurrentCertificateId(client, objectName) {
     return result.rows[0]?.id;
 }
 
+export async function lockLatestCertificateByObjectName(client, objectName) {
+    if (!objectName) {
+        return undefined;
+    }
+    const result = await client.query(
+        "SELECT Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Label " +
+            "FROM TlsCertificates WHERE ObjectName = $1 ORDER BY RotationOrdinal DESC LIMIT 1 FOR UPDATE",
+        [objectName]
+    );
+    return result.rows[0];
+}
+
 export async function retargetParentCertificateFks(client, notify, oldId, newId) {
     for (const table of TLS_CERTIFICATE_PARENT_TABLES) {
         const updated = await client.query(

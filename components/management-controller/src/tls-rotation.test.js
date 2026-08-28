@@ -21,6 +21,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
     deleteExpiredSupersededCertificates,
     getCurrentCertificateId,
+    lockLatestCertificateByObjectName,
     getTlsRotationMeta,
     retargetParentCertificateFks,
     timestampsEqual,
@@ -104,6 +105,20 @@ describe("getCurrentCertificateId", () => {
             expect.stringContaining("ORDER BY RotationOrdinal DESC"),
             ["vms-site-1"]
         );
+    });
+});
+
+describe("lockLatestCertificateByObjectName", () => {
+    it("locks the highest rotation ordinal for update", async () => {
+        const row = { id: "current-id", rotationordinal: 2 };
+        const client = {
+            query: vi.fn(async () => ({ rows: [row] })),
+        };
+
+        await expect(lockLatestCertificateByObjectName(client, "vms-site-1")).resolves.toBe(row);
+        expect(client.query).toHaveBeenCalledWith(expect.stringContaining("FOR UPDATE"), [
+            "vms-site-1",
+        ]);
     });
 });
 

@@ -109,6 +109,36 @@ function mockDbForReconcile() {
                 ],
             };
         }
+        if (sql.includes("InteriorSites.CoLocated = true AND InteriorSites.Certificate")) {
+            return { rowCount: 1, rows: [{ id: SITE_ID }] };
+        }
+        if (sql.includes("SELECT * FROM InteriorSites WHERE Id = $1")) {
+            return {
+                rowCount: 1,
+                rows: [
+                    {
+                        id: SITE_ID,
+                        name: "co-located",
+                        lifecycle: "ready",
+                        certificate: SITE_CERT_ID,
+                    },
+                ],
+            };
+        }
+        if (sql.includes("SELECT * FROM BackboneAccessPoints WHERE Id = $1")) {
+            return {
+                rowCount: 1,
+                rows: [
+                    {
+                        id: AP_ID,
+                        lifecycle: "ready",
+                        certificate: AP_CERT_ID,
+                        hostname: "manage.example.com",
+                        port: 5671,
+                    },
+                ],
+            };
+        }
         if (
             sql.includes("FROM BackboneAccessPoints WHERE InteriorSite") &&
             sql.includes("manage")
@@ -180,6 +210,11 @@ describe("colo-sync Start", () => {
         );
         expect(RegisterNotification).toHaveBeenCalledWith(
             "BackboneAccessPoints",
+            expect.any(Function),
+            false
+        );
+        expect(RegisterNotification).toHaveBeenCalledWith(
+            "TlsCertificates",
             expect.any(Function),
             false
         );
@@ -312,5 +347,43 @@ describe("colo-sync TLS secret sync", () => {
 
         expect(ReplaceSecret).not.toHaveBeenCalled();
         expect(ApplyObject).not.toHaveBeenCalled();
+    });
+
+    it("copies rotated TLS secrets when a TlsCertificates row changes", async () => {
+        await Start();
+        await triggerInitialReconcile();
+        ReplaceSecret.mockClear();
+
+        const rotatedSiteSecret = {
+            data: { "tls.crt": "rotated-site", "tls.key": "rotated-key", "ca.crt": "ca" },
+        };
+        LoadSecret.mockImplementation(async (name, ns) => {
+            if (name === MC_SITE_SECRET_NAME) {
+                return rotatedSiteSecret;
+            }
+            if (name === MC_AP_SECRET_NAME) {
+                return mcApSecret;
+            }
+            if (name === SITE_SECRET_NAME && ns === COLO_NS) {
+                return mcSiteSecret;
+            }
+            if (name === AP_SECRET_NAME && ns === COLO_NS) {
+                return mcApSecret;
+            }
+            return undefined;
+        });
+
+        const tlsHandler = [...RegisterNotification.mock.calls]
+            .reverse()
+            .find((call) => call[0] === "TlsCertificates")[1];
+        await tlsHandler("UPDATE", SITE_CERT_ID);
+
+        expect(ReplaceSecret).toHaveBeenCalledWith(
+            SITE_SECRET_NAME,
+            expect.objectContaining({
+                data: rotatedSiteSecret.data,
+            }),
+            COLO_NS
+        );
     });
 });
