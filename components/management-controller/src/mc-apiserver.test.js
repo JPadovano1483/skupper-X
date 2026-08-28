@@ -18,6 +18,7 @@
 */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import express from "express";
 import request from "supertest";
 import { createMockClient, TEST_UUIDS } from "./test-helpers/mock-db.js";
 import { buildApiApp } from "./test-helpers/build-api-app.js";
@@ -218,6 +219,71 @@ describe("mc-apiserver routes", () => {
 
         expect(certsSql).toContain("expiration <= NOW()");
         expect(certsParams).toEqual([30]);
+    });
+
+    it("GET /certs registers a table-wide TlsCertificates watch", async () => {
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        let registeredWatch;
+        const originalJson = express.response.json;
+        const jsonSpy = vi.spyOn(express.response, "json").mockImplementation(function (body) {
+            registeredWatch = this._watch;
+            return originalJson.call(this, body);
+        });
+        try {
+            await request(app).get("/api/v1alpha1/certs").set("x-test-auth", "1").expect(200);
+            expect(registeredWatch).toEqual([{ table: "TlsCertificates" }]);
+        } finally {
+            jsonSpy.mockRestore();
+        }
+    });
+
+    it("GET /certs?signedby= registers a table-wide TlsCertificates watch", async () => {
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("SELECT isca FROM tlsCertificates")) {
+                return { rowCount: 1, rows: [{ isca: true }] };
+            }
+            if (sql.includes("FROM tlsCertificates WHERE signedBy =")) {
+                return { rows: [{ id: TEST_UUIDS.cert }], rowCount: 1 };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        let registeredWatch;
+        const originalJson = express.response.json;
+        const jsonSpy = vi.spyOn(express.response, "json").mockImplementation(function (body) {
+            registeredWatch = this._watch;
+            return originalJson.call(this, body);
+        });
+        try {
+            await request(app)
+                .get("/api/v1alpha1/certs")
+                .query({ signedby: TEST_UUIDS.cert })
+                .set("x-test-auth", "1")
+                .expect(200);
+            expect(registeredWatch).toEqual([{ table: "TlsCertificates" }]);
+        } finally {
+            jsonSpy.mockRestore();
+        }
     });
 
     it("GET /vans/:vid/config/nonconnecting returns network yaml", async () => {

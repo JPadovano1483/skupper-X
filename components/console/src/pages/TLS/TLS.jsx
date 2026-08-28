@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import {
     Breadcrumb,
     BreadcrumbItem,
@@ -22,6 +22,7 @@ import {
     SelectItem,
 } from "@carbon/react";
 import { Certificate, DocumentSigned } from "@carbon/icons-react";
+import { CancelWatch, CreateWatch } from "../../tools/watch";
 
 const certsUrl = ({ signedBy, expiresWithin } = {}) => {
     const params = new URLSearchParams();
@@ -66,68 +67,76 @@ const TLS = () => {
     const [certToRotateKey, setCertToRotateKey] = useState(null);
     const [rotateKeyError, setRotateKeyError] = useState(null);
 
-    const fetchCertificates = useCallback(
-        async ({ showLoading = true } = {}) => {
-            try {
-                if (showLoading) {
-                    setLoading(true);
-                }
-                setError(null);
-                const response = await fetch(certsUrl({ expiresWithin }));
-
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-
-                const data = await response.json();
-                setCertificates(data);
-            } catch (err) {
-                setError(err.message);
-                console.error("Error fetching certificates:", err);
-            } finally {
-                if (showLoading) {
-                    setLoading(false);
-                }
-            }
-        },
-        [expiresWithin]
+    const expandedIssuerIds = useMemo(
+        () =>
+            Object.entries(expandedRows)
+                .filter(([, isExpanded]) => isExpanded)
+                .map(([id]) => id)
+                .sort((a, b) => a.localeCompare(b))
+                .join(","),
+        [expandedRows]
     );
 
     useEffect(() => {
         setExpandedRows({});
         setChildCerts({});
-        fetchCertificates();
-    }, [fetchCertificates]);
+        setLoadingChildren({});
+        setLoading(true);
+        setError(null);
 
-    const fetchChildCertificates = async (issuerId, { force = false } = {}) => {
-        if (!force && childCerts[issuerId]) {
-            return;
-        }
-
-        try {
-            setLoadingChildren((prev) => ({ ...prev, [issuerId]: true }));
-            const response = await fetch(certsUrl({ signedBy: issuerId, expiresWithin }));
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
+        const watchContext = CreateWatch(certsUrl({ expiresWithin }), function (message) {
+            const body = message.body;
+            if (body.method === "GET" || body.method === "UPDATE") {
+                if (body.statusCode >= 200 && body.statusCode < 300) {
+                    setCertificates(body.content);
+                    setError(null);
+                    setLoading(false);
+                } else {
+                    setError(body.content);
+                    setLoading(false);
+                }
             }
+        });
 
-            const data = await response.json();
-            setChildCerts((prev) => ({ ...prev, [issuerId]: data }));
-        } catch (err) {
-            console.error("Error fetching child certificates:", err);
-        } finally {
-            setLoadingChildren((prev) => ({ ...prev, [issuerId]: false }));
+        return () => {
+            CancelWatch(watchContext);
+        };
+    }, [expiresWithin]);
+
+    useEffect(() => {
+        if (!expandedIssuerIds) {
+            return undefined;
         }
-    };
 
-    const refreshCertificates = async () => {
-        await fetchCertificates({ showLoading: false });
-        const issuerIds = Object.keys(childCerts);
-        await Promise.all(
-            issuerIds.map((issuerId) => fetchChildCertificates(issuerId, { force: true }))
+        const issuerIds = expandedIssuerIds.split(",");
+        setLoadingChildren((prev) => {
+            const next = { ...prev };
+            let changed = false;
+            for (const issuerId of issuerIds) {
+                if (next[issuerId] !== false) {
+                    next[issuerId] = true;
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+
+        const watches = issuerIds.map((issuerId) =>
+            CreateWatch(certsUrl({ signedBy: issuerId, expiresWithin }), function (message) {
+                const body = message.body;
+                if (body.method === "GET" || body.method === "UPDATE") {
+                    if (body.statusCode >= 200 && body.statusCode < 300) {
+                        setChildCerts((prev) => ({ ...prev, [issuerId]: body.content }));
+                    }
+                    setLoadingChildren((prev) => ({ ...prev, [issuerId]: false }));
+                }
+            })
         );
-    };
+
+        return () => {
+            watches.forEach(CancelWatch);
+        };
+    }, [expandedIssuerIds, expiresWithin]);
 
     const formatDate = (dateString) => {
         if (!dateString) return "N/A";
@@ -178,7 +187,6 @@ const TLS = () => {
                 title: "Certificate rotation requested",
                 subtitle: cert.label || cert.id,
             });
-            await refreshCertificates();
         } catch (err) {
             setActionNotice({
                 kind: "error",
@@ -213,7 +221,6 @@ const TLS = () => {
                 subtitle: certToRotateKey.label || certToRotateKey.id,
             });
             setCertToRotateKey(null);
-            await refreshCertificates();
         } catch (err) {
             setRotateKeyError(err.message);
         } finally {
@@ -258,10 +265,6 @@ const TLS = () => {
                 ...prev,
                 [cert.id]: !prev[cert.id],
             }));
-
-            if (!childCerts[cert.id] && !isExpanded) {
-                fetchChildCertificates(cert.id);
-            }
         };
 
         const indentStyle = {

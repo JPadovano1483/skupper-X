@@ -134,6 +134,14 @@ const mutex = new Mutex();
 
 let watchDispatch = sendUpdate;
 
+function queryFromWatchAddress(url) {
+    const qIndex = url.indexOf("?");
+    if (qIndex === -1) {
+        return {};
+    }
+    return Object.fromEntries(new URLSearchParams(url.slice(qIndex + 1)));
+}
+
 async function sendUpdate(watch, isInitial) {
     const release = await mutex.acquire();
     const url = watch.source.address;
@@ -144,7 +152,7 @@ async function sendUpdate(watch, isInitial) {
 
         req.url = url;
         req.method = "GET";
-        req.query = {};
+        req.query = queryFromWatchAddress(url);
         req._skip_log = !isInitial;
 
         router.handle(req, res, (err) => {
@@ -259,4 +267,9 @@ export function _registerWatchForTest(tableName, id, watch) {
 /** @internal Exported for unit tests */
 export function _setWatchDispatchForTest(fn) {
     watchDispatch = fn ?? sendUpdate;
+}
+
+/** @internal Exported for unit tests */
+export function _queryFromWatchAddressForTest(url) {
+    return queryFromWatchAddress(url);
 }

@@ -18,7 +18,12 @@
 */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { WatchNotify, _registerWatchForTest, _setWatchDispatchForTest } from "./watch-server.js";
+import {
+    WatchNotify,
+    _registerWatchForTest,
+    _setWatchDispatchForTest,
+    _queryFromWatchAddressForTest,
+} from "./watch-server.js";
 
 describe("WatchNotify", () => {
     beforeEach(() => {
@@ -52,5 +57,22 @@ describe("WatchNotify", () => {
         expect(dispatch).toHaveBeenCalledTimes(2);
         expect(dispatch).toHaveBeenCalledWith(idWatch, false);
         expect(dispatch).toHaveBeenCalledWith(allWatch, false);
+    });
+});
+
+describe("queryFromWatchAddress", () => {
+    it("returns an empty query object when the address has no search string", () => {
+        expect(_queryFromWatchAddressForTest("/api/v1alpha1/certs")).toEqual({});
+    });
+
+    it("parses list-filter query parameters from the watch address", () => {
+        expect(
+            _queryFromWatchAddressForTest(
+                "/api/v1alpha1/certs?signedby=11111111-1111-4111-8111-111111111111&expiresWithin=30"
+            )
+        ).toEqual({
+            signedby: "11111111-1111-4111-8111-111111111111",
+            expiresWithin: "30",
+        });
     });
 });

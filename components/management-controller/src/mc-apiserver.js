@@ -393,6 +393,7 @@ const getCertsSignedBy = async function (req, res) {
             }
             return await client.query(sql, params);
         });
+        res._watch = [{ table: "TlsCertificates" }];
         res.status(returnStatus).json(result.rows);
     } catch (err) {
         returnStatus = 400;
