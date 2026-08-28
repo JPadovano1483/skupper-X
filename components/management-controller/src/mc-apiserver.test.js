@@ -221,6 +221,37 @@ describe("mc-apiserver routes", () => {
         expect(certsParams).toEqual([30]);
     });
 
+    it("GET /certs marks rows superseded by a newer generation", async () => {
+        let certsSql;
+        mockClient.query.mockImplementation(async (sql) => {
+            if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+                return {};
+            }
+            if (sql.includes("INSERT INTO Users")) {
+                return { rows: [{ id: "internal-user-1" }] };
+            }
+            if (sql.includes("set_config")) {
+                return {};
+            }
+            if (sql.includes("FROM tlsCertificates WHERE signedBy IS NULL")) {
+                certsSql = sql;
+                return { rows: [], rowCount: 0 };
+            }
+            return { rows: [], rowCount: 0 };
+        });
+
+        const { app } = await buildApiApp({
+            includeAdmin: false,
+            includeUser: false,
+            includeMcRoutes: true,
+        });
+
+        await request(app).get("/api/v1alpha1/certs").set("x-test-auth", "1").expect(200);
+
+        expect(certsSql).toContain("AS superseded");
+        expect(certsSql).toContain("newer.Supercedes = tlsCertificates.Id");
+    });
+
     it("GET /certs registers a table-wide TlsCertificates watch", async () => {
         const { app } = await buildApiApp({
             includeAdmin: false,

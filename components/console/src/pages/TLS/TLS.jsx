@@ -36,6 +36,38 @@ const certsUrl = ({ signedBy, expiresWithin } = {}) => {
     return qs ? `/api/v1alpha1/certs?${qs}` : "/api/v1alpha1/certs";
 };
 
+const collectKnownCerts = (rootCerts, childrenByIssuer) => {
+    const byId = new Map();
+    for (const cert of rootCerts) {
+        byId.set(cert.id, cert);
+    }
+    for (const children of Object.values(childrenByIssuer)) {
+        if (!Array.isArray(children)) {
+            continue;
+        }
+        for (const cert of children) {
+            byId.set(cert.id, cert);
+        }
+    }
+    return [...byId.values()];
+};
+
+const isCertSuperseded = (cert, knownCerts) => {
+    if (cert.superseded === true) {
+        return true;
+    }
+    if (knownCerts.some((other) => other.supercedes === cert.id)) {
+        return true;
+    }
+    if (!cert.objectname) {
+        return false;
+    }
+    const ordinal = cert.rotationordinal ?? 0;
+    return knownCerts.some(
+        (other) => other.objectname === cert.objectname && (other.rotationordinal ?? 0) > ordinal
+    );
+};
+
 const postCertAction = async (certId, action, query) => {
     const qs = query ? `?${new URLSearchParams(query)}` : "";
     const response = await fetch(`/api/v1alpha1/certs/${certId}/${action}${qs}`, {
@@ -138,6 +170,11 @@ const TLS = () => {
         };
     }, [expandedIssuerIds, expiresWithin]);
 
+    const knownCerts = useMemo(
+        () => collectKnownCerts(certificates, childCerts),
+        [certificates, childCerts]
+    );
+
     const formatDate = (dateString) => {
         if (!dateString) return "N/A";
         const date = new Date(dateString);
@@ -178,6 +215,9 @@ const TLS = () => {
     };
 
     const handleRotate = async (cert) => {
+        if (isCertSuperseded(cert, knownCerts)) {
+            return;
+        }
         try {
             setActionBusy(true);
             setActionNotice(null);
@@ -200,7 +240,7 @@ const TLS = () => {
     };
 
     const openRotateKeyModal = (cert) => {
-        if (!cert.isca) {
+        if (!cert.isca || isCertSuperseded(cert, knownCerts)) {
             return;
         }
         setCertToRotateKey(cert);
@@ -208,7 +248,7 @@ const TLS = () => {
     };
 
     const handleRotateKey = async () => {
-        if (!certToRotateKey?.isca) {
+        if (!certToRotateKey?.isca || isCertSuperseded(certToRotateKey, knownCerts)) {
             return;
         }
         try {
@@ -228,21 +268,39 @@ const TLS = () => {
         }
     };
 
-    const renderCertActions = (cert) => (
-        <OverflowMenu size="sm" flipped>
-            <OverflowMenuItem
-                itemText="Rotate"
-                disabled={actionBusy}
-                onClick={() => handleRotate(cert)}
-            />
-            {cert.isca && (
+    const renderCertActions = (cert) => {
+        const superseded = isCertSuperseded(cert, knownCerts);
+        return (
+            <OverflowMenu size="sm" flipped>
                 <OverflowMenuItem
-                    itemText="Rotate CA key"
-                    disabled={actionBusy}
-                    onClick={() => openRotateKeyModal(cert)}
+                    itemText="Rotate"
+                    disabled={actionBusy || superseded}
+                    title={superseded ? "Certificate has been superseded" : undefined}
+                    onClick={() => handleRotate(cert)}
                 />
-            )}
-        </OverflowMenu>
+                {cert.isca && (
+                    <OverflowMenuItem
+                        itemText="Rotate CA key"
+                        disabled={actionBusy || superseded}
+                        title={superseded ? "Certificate has been superseded" : undefined}
+                        onClick={() => openRotateKeyModal(cert)}
+                    />
+                )}
+            </OverflowMenu>
+        );
+    };
+
+    const renderGenerationCell = (cert, superseded) => (
+        <TableCell>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                {cert.rotationordinal}
+                {superseded && (
+                    <Tag type="gray" size="sm">
+                        Superseded
+                    </Tag>
+                )}
+            </div>
+        </TableCell>
     );
 
     const headers = [
@@ -259,6 +317,8 @@ const TLS = () => {
         const isExpanded = expandedRows[cert.id] || false;
         const children = childCerts[cert.id] || [];
         const isLoadingChildren = loadingChildren[cert.id] || false;
+        const superseded = isCertSuperseded(cert, knownCerts);
+        const rowClassName = superseded ? "tls-cert-row--superseded" : undefined;
 
         const handleExpand = () => {
             setExpandedRows((prev) => ({
@@ -275,7 +335,11 @@ const TLS = () => {
             // CA certificates - use TableExpandRow
             return (
                 <React.Fragment key={cert.id}>
-                    <TableExpandRow isExpanded={isExpanded} onExpand={handleExpand}>
+                    <TableExpandRow
+                        isExpanded={isExpanded}
+                        onExpand={handleExpand}
+                        className={rowClassName}
+                    >
                         <TableCell>
                             <div style={{ display: "flex", alignItems: "center", ...indentStyle }}>
                                 {renderIcon(true)}
@@ -289,7 +353,7 @@ const TLS = () => {
                             </Tag>
                         </TableCell>
                         <TableCell>{formatDate(cert.renewaltime)}</TableCell>
-                        <TableCell>{cert.rotationordinal}</TableCell>
+                        {renderGenerationCell(cert, superseded)}
                         <TableCell>{renderCertActions(cert)}</TableCell>
                     </TableExpandRow>
                     {isExpanded && isLoadingChildren && (
@@ -317,7 +381,7 @@ const TLS = () => {
         } else {
             // Non-CA certificates - always need empty cell for expand column
             return (
-                <TableRow key={cert.id}>
+                <TableRow key={cert.id} className={rowClassName}>
                     <TableCell />
                     <TableCell>
                         <div style={{ display: "flex", alignItems: "center", ...indentStyle }}>
@@ -332,7 +396,7 @@ const TLS = () => {
                         </Tag>
                     </TableCell>
                     <TableCell>{formatDate(cert.renewaltime)}</TableCell>
-                    <TableCell>{cert.rotationordinal}</TableCell>
+                    {renderGenerationCell(cert, superseded)}
                     <TableCell>{renderCertActions(cert)}</TableCell>
                 </TableRow>
             );
@@ -440,7 +504,11 @@ const TLS = () => {
                     setRotateKeyError(null);
                 }}
                 onRequestSubmit={handleRotateKey}
-                primaryButtonDisabled={actionBusy || !certToRotateKey?.isca}
+                primaryButtonDisabled={
+                    actionBusy ||
+                    !certToRotateKey?.isca ||
+                    isCertSuperseded(certToRotateKey, knownCerts)
+                }
             >
                 {rotateKeyError && (
                     <InlineNotification

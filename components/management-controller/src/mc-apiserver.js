@@ -382,9 +382,11 @@ const getCertsSignedBy = async function (req, res) {
                     throw new Error(`signedby certificate is not an issuer`);
                 }
             }
+            const supersededSelect =
+                "EXISTS (SELECT 1 FROM tlsCertificates newer WHERE newer.Supercedes = tlsCertificates.Id) AS superseded";
             let sql = ca
-                ? "SELECT * FROM tlsCertificates WHERE signedBy = $1"
-                : "SELECT * FROM tlsCertificates WHERE signedBy IS NULL";
+                ? `SELECT tlsCertificates.*, ${supersededSelect} FROM tlsCertificates WHERE signedBy = $1`
+                : `SELECT tlsCertificates.*, ${supersededSelect} FROM tlsCertificates WHERE signedBy IS NULL`;
             const params = ca ? [ca] : [];
             if (expiresWithinDays !== undefined) {
                 const expiresParam = params.length + 1;
