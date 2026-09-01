@@ -68,11 +68,10 @@ describe("queryFromWatchAddress", () => {
     it("parses list-filter query parameters from the watch address", () => {
         expect(
             _queryFromWatchAddressForTest(
-                "/api/v1alpha1/certs?signedby=11111111-1111-4111-8111-111111111111&expiresWithin=30"
+                "/api/v1alpha1/certs?signedby=11111111-1111-4111-8111-111111111111"
             )
         ).toEqual({
             signedby: "11111111-1111-4111-8111-111111111111",
-            expiresWithin: "30",
         });
     });
 });

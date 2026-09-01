@@ -368,7 +368,6 @@ const getCertsSignedBy = async function (req, res) {
     const client = await ClientFromPool();
     try {
         const ca = req.query.signedby;
-        const expiresWithinDays = util.parseExpiresWithinDays(req.query.expiresWithin);
         if (ca && !util.IsValidUuid(ca)) {
             throw new Error(`Malformed signedby reference: ${ca}`);
         }
@@ -384,15 +383,10 @@ const getCertsSignedBy = async function (req, res) {
             }
             const supersededSelect =
                 "EXISTS (SELECT 1 FROM tlsCertificates newer WHERE newer.Supercedes = tlsCertificates.Id) AS superseded";
-            let sql = ca
+            const sql = ca
                 ? `SELECT tlsCertificates.*, ${supersededSelect} FROM tlsCertificates WHERE signedBy = $1`
                 : `SELECT tlsCertificates.*, ${supersededSelect} FROM tlsCertificates WHERE signedBy IS NULL`;
             const params = ca ? [ca] : [];
-            if (expiresWithinDays !== undefined) {
-                const expiresParam = params.length + 1;
-                sql += ` AND expiration IS NOT NULL AND expiration <= NOW() + ($${expiresParam}::integer * INTERVAL '1 day')`;
-                params.push(expiresWithinDays);
-            }
             return await client.query(sql, params);
         });
         res._watch = [{ table: "TlsCertificates" }];

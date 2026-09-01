@@ -17,22 +17,15 @@ import {
     Loading,
     OverflowMenu,
     OverflowMenuItem,
-    Select,
-    SelectItem,
 } from "@carbon/react";
 import { Certificate, DocumentSigned } from "@carbon/icons-react";
 import { CancelWatch, CreateWatch } from "../../tools/watch";
 
-const certsUrl = ({ signedBy, expiresWithin } = {}) => {
-    const params = new URLSearchParams();
+const certsUrl = ({ signedBy } = {}) => {
     if (signedBy) {
-        params.set("signedby", signedBy);
+        return `/api/v1alpha1/certs?signedby=${signedBy}`;
     }
-    if (expiresWithin) {
-        params.set("expiresWithin", String(expiresWithin));
-    }
-    const qs = params.toString();
-    return qs ? `/api/v1alpha1/certs?${qs}` : "/api/v1alpha1/certs";
+    return "/api/v1alpha1/certs";
 };
 
 const collectKnownCerts = (rootCerts, childrenByIssuer) => {
@@ -91,7 +84,6 @@ const TLS = () => {
     const [expandedRows, setExpandedRows] = useState({});
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
-    const [expiresWithin, setExpiresWithin] = useState("");
     const [actionNotice, setActionNotice] = useState(null);
     const [actionBusy, setActionBusy] = useState(false);
 
@@ -112,7 +104,7 @@ const TLS = () => {
         setLoading(true);
         setError(null);
 
-        const watchContext = CreateWatch(certsUrl({ expiresWithin }), function (message) {
+        const watchContext = CreateWatch(certsUrl(), function (message) {
             const body = message.body;
             if (body.method === "GET" || body.method === "UPDATE") {
                 if (body.statusCode >= 200 && body.statusCode < 300) {
@@ -129,7 +121,7 @@ const TLS = () => {
         return () => {
             CancelWatch(watchContext);
         };
-    }, [expiresWithin]);
+    }, []);
 
     useEffect(() => {
         if (!expandedIssuerIds) {
@@ -150,7 +142,7 @@ const TLS = () => {
         });
 
         const watches = issuerIds.map((issuerId) =>
-            CreateWatch(certsUrl({ signedBy: issuerId, expiresWithin }), function (message) {
+            CreateWatch(certsUrl({ signedBy: issuerId }), function (message) {
                 const body = message.body;
                 if (body.method === "GET" || body.method === "UPDATE") {
                     if (body.statusCode >= 200 && body.statusCode < 300) {
@@ -164,7 +156,7 @@ const TLS = () => {
         return () => {
             watches.forEach(CancelWatch);
         };
-    }, [expandedIssuerIds, expiresWithin]);
+    }, [expandedIssuerIds]);
 
     const knownCerts = useMemo(
         () => collectKnownCerts(certificates, childCerts),
@@ -379,20 +371,6 @@ const TLS = () => {
                 </p>
             </div>
 
-            <div style={{ marginBottom: "1rem", maxWidth: "300px" }}>
-                <Select
-                    id="tls-expires-within"
-                    labelText="Expiration"
-                    value={expiresWithin}
-                    onChange={(e) => setExpiresWithin(e.target.value)}
-                >
-                    <SelectItem value="" text="All certificates" />
-                    <SelectItem value="7" text="Expiring within 7 days" />
-                    <SelectItem value="14" text="Expiring within 14 days" />
-                    <SelectItem value="30" text="Expiring within 30 days" />
-                </Select>
-            </div>
-
             {loading && <Loading description="Loading certificates..." withOverlay={false} />}
 
             {error && (
@@ -419,11 +397,7 @@ const TLS = () => {
                 <InlineNotification
                     kind="info"
                     title="No certificates found"
-                    subtitle={
-                        expiresWithin
-                            ? "No certificates expire within the selected window."
-                            : "There are currently no certificates configured."
-                    }
+                    subtitle="There are currently no certificates configured."
                     hideCloseButton
                     style={{ marginBottom: "1rem" }}
                 />
