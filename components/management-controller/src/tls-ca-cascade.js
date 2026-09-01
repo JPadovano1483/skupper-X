@@ -27,15 +27,12 @@ import {
     DeleteSecret,
     LoadCertificate,
     LoadSecret,
-    ReplaceCertificate,
-    TriggerCertificateRenewal,
-    setCertificateIssuerRef,
 } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
 import { ClientFromPool } from "./db.js";
 import { NotifyTransaction } from "./notify.js";
-import { retargetParentCertificateFks } from "./tls-rotation.js";
+import { expirationFromTlsSecret, retargetParentCertificateFks } from "./tls-rotation.js";
 
 const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
 const DEFAULT_CA_DURATION = "8760h";
@@ -55,7 +52,12 @@ function httpError(statusCode, message) {
 }
 
 function kubeStatusCode(err) {
-    return err?.statusCode || err?.code || err?.response?.statusCode;
+    const direct = err?.statusCode || err?.code || err?.response?.statusCode;
+    if (typeof direct === "number") {
+        return direct;
+    }
+    const match = /HTTP-Code:\s*(\d+)/.exec(err?.message || "");
+    return match ? Number(match[1]) : direct;
 }
 
 function delay(ms) {
@@ -127,7 +129,6 @@ function newCaCertificateObject(oldCert, { name, dbLink, issuerName, issuerLink 
                 algorithm: oldCert.spec?.privateKey?.algorithm || "RSA",
                 encoding: oldCert.spec?.privateKey?.encoding || "PKCS1",
                 size: oldCert.spec?.privateKey?.size || 2048,
-                rotationPolicy: "Never",
             },
             usages: oldCert.spec?.usages || ["signing"],
             issuerRef: {
@@ -136,6 +137,55 @@ function newCaCertificateObject(oldCert, { name, dbLink, issuerName, issuerLink 
                 group: oldCert.spec?.issuerRef?.group || "cert-manager.io",
             },
         },
+    };
+}
+
+function newLeafCertificateObject(oldCert, { name, dbLink, issuerName, issuerLink }) {
+    const secretAnnotations = {
+        ...(oldCert.spec?.secretTemplate?.annotations || {}),
+        [META_ANNOTATION_VMS_CONTROLLED]: "true",
+        [META_ANNOTATION_VMS_DBLINK]: dbLink,
+        [ISSUER_LINK_ANNOTATION]: issuerLink,
+    };
+    const commonName =
+        oldCert.spec?.commonName && oldCert.spec.commonName !== oldCert.metadata?.name
+            ? oldCert.spec.commonName
+            : name;
+    const spec = {
+        secretName: name,
+        secretTemplate: {
+            ...oldCert.spec?.secretTemplate,
+            annotations: secretAnnotations,
+        },
+        duration: oldCert.spec?.duration || DEFAULT_CA_DURATION,
+        subject: oldCert.spec?.subject,
+        commonName: commonName,
+        isCA: false,
+        privateKey: {
+            algorithm: oldCert.spec?.privateKey?.algorithm || "RSA",
+            encoding: oldCert.spec?.privateKey?.encoding || "PKCS1",
+            size: oldCert.spec?.privateKey?.size || 2048,
+        },
+        usages: oldCert.spec?.usages || ["client auth"],
+        issuerRef: {
+            name: issuerName,
+            kind: oldCert.spec?.issuerRef?.kind || "Issuer",
+            group: oldCert.spec?.issuerRef?.group || "cert-manager.io",
+        },
+    };
+    if (oldCert.spec?.dnsNames) {
+        spec.dnsNames = oldCert.spec.dnsNames;
+    }
+    return {
+        apiVersion: "cert-manager.io/v1",
+        kind: "Certificate",
+        metadata: {
+            name: name,
+            annotations: {
+                [META_ANNOTATION_VMS_DBLINK]: dbLink,
+            },
+        },
+        spec,
     };
 }
 
@@ -162,15 +212,63 @@ async function listLiveChildren(client, caId) {
     return result.rows;
 }
 
+async function listLiveChildrenWalkingPredecessors(client, caId) {
+    const children = [];
+    const seen = new Set();
+    const visited = new Set();
+    let currentId = caId;
+    while (currentId && !visited.has(currentId)) {
+        visited.add(currentId);
+        for (const child of await listLiveChildren(client, currentId)) {
+            if (!seen.has(child.id)) {
+                seen.add(child.id);
+                children.push(child);
+            }
+        }
+        const predecessor = await loadCertRow(client, currentId);
+        currentId = predecessor?.supercedes;
+    }
+    return children;
+}
+
 async function collectLiveDescendants(client, caId) {
     const descendants = [];
-    for (const child of await listLiveChildren(client, caId)) {
+    for (const child of await listLiveChildrenWalkingPredecessors(client, caId)) {
         descendants.push(child);
         if (child.isca) {
             descendants.push(...(await collectLiveDescendants(client, child.id)));
         }
     }
     return descendants;
+}
+
+async function orderChildrenForReissue(client, children) {
+    const leafIds = children.filter((child) => !child.isca && child.id).map((child) => child.id);
+    const manageIds = new Set();
+    if (leafIds.length > 0) {
+        const result = await client.query(
+            "SELECT Certificate FROM BackboneAccessPoints WHERE Kind = 'manage' AND Certificate = ANY($1::uuid[])",
+            [leafIds]
+        );
+        for (const row of result.rows) {
+            if (row.certificate) {
+                manageIds.add(row.certificate);
+            }
+        }
+    }
+    const nested = [];
+    const manage = [];
+    const other = [];
+    for (const child of children) {
+        if (child.isca) {
+            nested.push(child);
+        } else if (manageIds.has(child.id)) {
+            manage.push(child);
+        } else {
+            other.push(child);
+        }
+    }
+    return [...nested, ...other, ...manage];
 }
 
 async function hasLiveChildren(client, caId) {
@@ -213,7 +311,7 @@ async function waitForReadySecret(name, timeoutMs, intervalMs) {
             }
         }
         if (Date.now() >= deadline) {
-            throw httpError(504, `Timed out waiting for CA secret ${name}`);
+            throw httpError(504, `Timed out waiting for certificate secret ${name}`);
         }
         await delay(intervalMs);
     }
@@ -225,6 +323,10 @@ async function deleteNewCaKube(name) {
     } catch (error) {
         Log(`WARN: Failed to delete Issuer ${name}: ${error.message}`);
     }
+    await deleteNewLeafKube(name);
+}
+
+async function deleteNewLeafKube(name) {
     try {
         await DeleteCertificate(name);
     } catch (error) {
@@ -343,13 +445,76 @@ function flattenReissueIds(node) {
     return ids;
 }
 
-async function retargetLeafIssuer(child, issuerName, newCaId) {
-    const kubeCert = await loadCertificateOrThrow(child.objectname, 409);
-    const updated = setCertificateIssuerRef(kubeCert, issuerName, newCaId);
-    if (updated) {
-        await ReplaceCertificate(updated);
+async function reissueLeafUnderNewCa(child, issuerName, newCaId, options = {}) {
+    const secretTimeoutMs = options.secretTimeoutMs ?? DEFAULT_SECRET_TIMEOUT_MS;
+    const secretIntervalMs = options.secretIntervalMs ?? DEFAULT_SECRET_INTERVAL_MS;
+    const newId = options.newId || randomUUID();
+    const oldKubeCert = await loadCertificateOrThrow(child.objectname, 409);
+    const newObjectName = nextCaObjectName(child.objectname, newId);
+    const certObj = newLeafCertificateObject(oldKubeCert, {
+        name: newObjectName,
+        dbLink: newId,
+        issuerName,
+        issuerLink: newCaId,
+    });
+
+    const created = await ApplyObject(certObj);
+    if (!created) {
+        throw httpError(500, `Failed to create Certificate ${newObjectName}`);
     }
-    await TriggerCertificateRenewal(child.objectname);
+
+    let ready;
+    try {
+        ready = await waitForReadySecret(newObjectName, secretTimeoutMs, secretIntervalMs);
+    } catch (err) {
+        await deleteNewLeafKube(newObjectName);
+        throw err;
+    }
+
+    const expiration =
+        expirationFromTlsSecret(ready.secret) ||
+        (ready.cert.status?.notAfter ? new Date(ready.cert.status.notAfter) : undefined);
+    const renewal = ready.cert.status?.renewalTime
+        ? new Date(ready.cert.status.renewalTime)
+        : undefined;
+    const notify = new NotifyTransaction();
+    const writeClient = await ClientFromPool("system");
+    try {
+        await writeClient.query("BEGIN");
+        await writeClient.query(
+            "INSERT INTO TlsCertificates (Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Supercedes, Label) " +
+                "VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8)",
+            [
+                newId,
+                newObjectName,
+                newCaId,
+                expiration,
+                renewal,
+                (child.rotationordinal ?? 0) + 1,
+                child.id,
+                child.label,
+            ]
+        );
+        notify.add("TlsCertificates", newId);
+        await retargetParentCertificateFks(writeClient, notify, child.id, newId);
+        await writeClient.query("COMMIT");
+        await notify.commit();
+    } catch (err) {
+        Log(`Rolling back leaf re-issue transaction: ${err.stack}`);
+        await writeClient.query("ROLLBACK");
+        await deleteNewLeafKube(newObjectName);
+        throw err;
+    } finally {
+        writeClient.release();
+    }
+
+    return {
+        id: newId,
+        previousId: child.id,
+        objectname: newObjectName,
+        isca: false,
+        action: "reissue",
+    };
 }
 
 export async function rotateCaKey(oldCaId, options = {}) {
@@ -418,9 +583,9 @@ export async function rotateCaKey(oldCaId, options = {}) {
         throw err;
     }
 
-    const expiration = ready.cert.status?.notAfter
-        ? new Date(ready.cert.status.notAfter)
-        : undefined;
+    const expiration =
+        expirationFromTlsSecret(ready.secret) ||
+        (ready.cert.status?.notAfter ? new Date(ready.cert.status.notAfter) : undefined);
     const renewal = ready.cert.status?.renewalTime
         ? new Date(ready.cert.status.renewalTime)
         : undefined;
@@ -456,32 +621,51 @@ export async function rotateCaKey(oldCaId, options = {}) {
     }
 
     const children = [];
+    const failures = [];
     const childClient = await ClientFromPool("system");
     try {
-        const liveChildren = await listLiveChildren(childClient, oldCert.id);
+        const liveChildren = await orderChildrenForReissue(
+            childClient,
+            await listLiveChildrenWalkingPredecessors(childClient, oldCert.id)
+        );
         for (const child of liveChildren) {
-            if (child.isca) {
-                children.push(
-                    await rotateCaKey(child.id, {
-                        issuerName: newObjectName,
-                        issuerLink: newId,
-                        signedBy: newId,
-                        secretTimeoutMs,
-                        secretIntervalMs,
-                    })
+            try {
+                if (child.isca) {
+                    children.push(
+                        await rotateCaKey(child.id, {
+                            issuerName: newObjectName,
+                            issuerLink: newId,
+                            signedBy: newId,
+                            secretTimeoutMs,
+                            secretIntervalMs,
+                        })
+                    );
+                } else {
+                    children.push(
+                        await reissueLeafUnderNewCa(child, newObjectName, newId, {
+                            secretTimeoutMs,
+                            secretIntervalMs,
+                        })
+                    );
+                }
+            } catch (err) {
+                Log(
+                    `Failed to re-issue ${child.objectname} (${child.id}) under ${newObjectName}: ${err.message}`
                 );
-            } else {
-                await retargetLeafIssuer(child, newObjectName, newId);
-                children.push({
-                    id: child.id,
-                    objectname: child.objectname,
-                    isca: false,
-                    action: "reissue",
-                });
+                failures.push({ child, err });
             }
         }
     } finally {
         childClient.release();
+    }
+
+    if (failures.length > 0) {
+        const first = failures[0].err;
+        const names = failures.map((f) => f.child.objectname || f.child.id).join(", ");
+        throw httpError(
+            kubeStatusCode(first) || first.statusCode || 500,
+            `Failed to re-issue ${failures.length} certificate(s) after CA rotation: ${names}: ${first.message}`
+        );
     }
 
     const keyRotation = {

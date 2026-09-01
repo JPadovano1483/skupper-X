@@ -19,6 +19,8 @@
 
 "use strict";
 
+import { X509Certificate } from "node:crypto";
+
 export const TLS_CERTIFICATE_PARENT_TABLES = [
     "ManagementControllers",
     "Backbones",
@@ -38,6 +40,23 @@ export function timestampsEqual(left, right) {
         return false;
     }
     return new Date(left).getTime() === new Date(right).getTime();
+}
+
+export function expirationFromTlsSecret(secret) {
+    const encoded = secret?.data?.["tls.crt"];
+    if (!encoded) {
+        return undefined;
+    }
+    try {
+        const pem = Buffer.from(encoded, "base64").toString("utf-8");
+        if (!pem.includes("BEGIN CERTIFICATE")) {
+            return undefined;
+        }
+        const x509 = new X509Certificate(pem);
+        return new Date(x509.validToDate ?? x509.validTo);
+    } catch {
+        return undefined;
+    }
 }
 
 export async function getTlsRotationMeta(client, objectName) {
@@ -88,7 +107,7 @@ export async function lockLatestCertificateByObjectName(client, objectName) {
         return undefined;
     }
     const result = await client.query(
-        "SELECT Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Label " +
+        "SELECT Id, IsCA, ObjectName, SignedBy, Expiration, RenewalTime, RotationOrdinal, Label, Supercedes " +
             "FROM TlsCertificates WHERE ObjectName = $1 ORDER BY RotationOrdinal DESC LIMIT 1 FOR UPDATE",
         [objectName]
     );

@@ -451,8 +451,7 @@ const getCertDetail = async function (req, res) {
 
 const rotateCert = async function (req, res) {
     try {
-        const rotateKey = req.query.rotateKey === "true" || req.query.rotateKey === "1";
-        const cert = await RotateCertificate(req.params.cid, { rotateKey });
+        const cert = await RotateCertificate(req.params.cid);
         res.status(202).json(cert);
     } catch (err) {
         const returnStatus = err.statusCode || 500;

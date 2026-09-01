@@ -355,6 +355,39 @@ describe("onTlsCertificateChange (via Start)", () => {
         expect(LoadSecret).not.toHaveBeenCalled();
         expect(OpenConnection).not.toHaveBeenCalled();
     });
+
+    it("refreshes the manage trust bundle when a new certificate is added", async () => {
+        LoadSecret.mockResolvedValue({
+            data: {
+                "ca.crt": Buffer.from("ca").toString("base64"),
+                "tls.crt": Buffer.from("cert").toString("base64"),
+                "tls.key": Buffer.from("key").toString("base64"),
+            },
+        });
+
+        mockClient.query.mockImplementation(mockReadyControllerQueries());
+
+        await Start("test-controller");
+        await vi.runOnlyPendingTimersAsync();
+        await vi.runOnlyPendingTimersAsync();
+
+        CloseConnection.mockClear();
+        OpenConnection.mockClear();
+        LoadSecret.mockClear();
+        LoadSecret.mockResolvedValue({
+            data: {
+                "ca.crt": Buffer.from("ca-and-new").toString("base64"),
+                "tls.crt": Buffer.from("cert").toString("base64"),
+                "tls.key": Buffer.from("key").toString("base64"),
+            },
+        });
+
+        await notificationHandlers.TlsCertificates("ADD", "new-ca-id");
+
+        expect(CloseConnection).not.toHaveBeenCalled();
+        expect(OpenConnection).not.toHaveBeenCalled();
+        expect(LoadSecret).toHaveBeenCalledWith("tls-secret");
+    });
 });
 
 async function startConnectedController(Start) {
@@ -390,7 +423,7 @@ describe("onAccessPointChange (via Start)", () => {
         vi.useRealTimers();
     });
 
-    it("reconnects manage AMQP when the access point certificate changes", async () => {
+    it("does not reconnect manage AMQP when only the access point certificate changes", async () => {
         await startConnectedController(Start);
         expect(OpenConnection).toHaveBeenCalledTimes(1);
         CloseConnection.mockClear();
@@ -415,16 +448,8 @@ describe("onAccessPointChange (via Start)", () => {
 
         await notificationHandlers.BackboneAccessPoints("UPDATE", "ap-1");
 
-        expect(CloseConnection).toHaveBeenCalledWith({ id: "mock-conn" });
-        expect(OpenConnection).toHaveBeenCalledWith(
-            "Backbone-management-ap-1",
-            "router.example.com",
-            5671,
-            "tls",
-            expect.any(Buffer),
-            expect.any(Buffer),
-            expect.any(Buffer)
-        );
+        expect(CloseConnection).not.toHaveBeenCalled();
+        expect(OpenConnection).not.toHaveBeenCalled();
     });
 
     it("reconnects manage AMQP when the access point endpoint changes", async () => {

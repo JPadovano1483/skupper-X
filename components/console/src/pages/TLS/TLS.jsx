@@ -17,7 +17,6 @@ import {
     Loading,
     OverflowMenu,
     OverflowMenuItem,
-    Modal,
     Select,
     SelectItem,
 } from "@carbon/react";
@@ -68,9 +67,8 @@ const isCertSuperseded = (cert, knownCerts) => {
     );
 };
 
-const postCertAction = async (certId, action, query) => {
-    const qs = query ? `?${new URLSearchParams(query)}` : "";
-    const response = await fetch(`/api/v1alpha1/certs/${certId}/${action}${qs}`, {
+const postCertAction = async (certId, action) => {
+    const response = await fetch(`/api/v1alpha1/certs/${certId}/${action}`, {
         method: "POST",
     });
     if (!response.ok) {
@@ -96,8 +94,6 @@ const TLS = () => {
     const [expiresWithin, setExpiresWithin] = useState("");
     const [actionNotice, setActionNotice] = useState(null);
     const [actionBusy, setActionBusy] = useState(false);
-    const [certToRotateKey, setCertToRotateKey] = useState(null);
-    const [rotateKeyError, setRotateKeyError] = useState(null);
 
     const expandedIssuerIds = useMemo(
         () =>
@@ -239,35 +235,6 @@ const TLS = () => {
         }
     };
 
-    const openRotateKeyModal = (cert) => {
-        if (!cert.isca || isCertSuperseded(cert, knownCerts)) {
-            return;
-        }
-        setCertToRotateKey(cert);
-        setRotateKeyError(null);
-    };
-
-    const handleRotateKey = async () => {
-        if (!certToRotateKey?.isca || isCertSuperseded(certToRotateKey, knownCerts)) {
-            return;
-        }
-        try {
-            setActionBusy(true);
-            setRotateKeyError(null);
-            await postCertAction(certToRotateKey.id, "rotate", { rotateKey: "true" });
-            setActionNotice({
-                kind: "success",
-                title: "CA key rotation requested",
-                subtitle: certToRotateKey.label || certToRotateKey.id,
-            });
-            setCertToRotateKey(null);
-        } catch (err) {
-            setRotateKeyError(err.message);
-        } finally {
-            setActionBusy(false);
-        }
-    };
-
     const renderCertActions = (cert) => {
         const superseded = isCertSuperseded(cert, knownCerts);
         return (
@@ -278,14 +245,6 @@ const TLS = () => {
                     title={superseded ? "Certificate has been superseded" : undefined}
                     onClick={() => handleRotate(cert)}
                 />
-                {cert.isca && (
-                    <OverflowMenuItem
-                        itemText="Rotate CA key"
-                        disabled={actionBusy || superseded}
-                        title={superseded ? "Certificate has been superseded" : undefined}
-                        onClick={() => openRotateKeyModal(cert)}
-                    />
-                )}
             </OverflowMenu>
         );
     };
@@ -492,41 +451,6 @@ const TLS = () => {
                     </Table>
                 </TableContainer>
             )}
-
-            <Modal
-                open={Boolean(certToRotateKey)}
-                danger
-                modalHeading="Rotate CA key"
-                primaryButtonText="Rotate key"
-                secondaryButtonText="Cancel"
-                onRequestClose={() => {
-                    setCertToRotateKey(null);
-                    setRotateKeyError(null);
-                }}
-                onRequestSubmit={handleRotateKey}
-                primaryButtonDisabled={
-                    actionBusy ||
-                    !certToRotateKey?.isca ||
-                    isCertSuperseded(certToRotateKey, knownCerts)
-                }
-            >
-                {rotateKeyError && (
-                    <InlineNotification
-                        kind="error"
-                        title="Cannot rotate CA key"
-                        subtitle={rotateKeyError}
-                        onCloseButtonClick={() => setRotateKeyError(null)}
-                        style={{ marginBottom: "1rem" }}
-                    />
-                )}
-
-                <p>
-                    Rotate the key for{" "}
-                    <strong>{certToRotateKey?.label || certToRotateKey?.id}</strong>? This issues a
-                    new CA and Issuer, re-issues every signed certificate, and keeps dual trust
-                    until cutover. This cannot be undone.
-                </p>
-            </Modal>
         </div>
     );
 };

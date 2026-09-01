@@ -20,6 +20,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
     deleteExpiredSupersededCertificates,
+    expirationFromTlsSecret,
     getCurrentCertificateId,
     lockLatestCertificateByObjectName,
     getTlsRotationMeta,
@@ -41,6 +42,31 @@ describe("timestampsEqual", () => {
         expect(
             timestampsEqual(new Date("2026-10-12T12:00:00.000Z"), "2026-09-01T12:00:00.000Z")
         ).toBe(false);
+    });
+});
+
+describe("expirationFromTlsSecret", () => {
+    it("returns undefined without a tls.crt", () => {
+        expect(expirationFromTlsSecret(undefined)).toBeUndefined();
+        expect(expirationFromTlsSecret({})).toBeUndefined();
+        expect(expirationFromTlsSecret({ data: {} })).toBeUndefined();
+    });
+
+    it("returns undefined for non-certificate secret data", () => {
+        expect(
+            expirationFromTlsSecret({
+                data: { "tls.crt": Buffer.from("not a cert").toString("base64") },
+            })
+        ).toBeUndefined();
+        expect(
+            expirationFromTlsSecret({
+                data: {
+                    "tls.crt": Buffer.from(
+                        "-----BEGIN CERTIFICATE-----\nnot-valid\n-----END CERTIFICATE-----"
+                    ).toString("base64"),
+                },
+            })
+        ).toBeUndefined();
     });
 });
 
@@ -116,6 +142,9 @@ describe("lockLatestCertificateByObjectName", () => {
         };
 
         await expect(lockLatestCertificateByObjectName(client, "vms-site-1")).resolves.toBe(row);
+        expect(client.query).toHaveBeenCalledWith(expect.stringContaining("Supercedes"), [
+            "vms-site-1",
+        ]);
         expect(client.query).toHaveBeenCalledWith(expect.stringContaining("FOR UPDATE"), [
             "vms-site-1",
         ]);

@@ -28,6 +28,7 @@ import { Log } from "@vms/modules/log";
 import { ClientFromPool } from "./db.js";
 import { OpenConnection, CloseConnection, OnConnectionClosed } from "@vms/modules/amqp";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
+import { overlayDualTrustCa } from "./tls-ca-cascade.js";
 
 const UNEXPECTED_RECONNECT_DELAY_MS = 1000;
 
@@ -40,11 +41,57 @@ const manageConnections = {};
 const registrations = [];
 
 function connectionNeedsRefresh(existing, row) {
-    return (
-        existing.host !== row.hostname ||
-        String(existing.port) !== String(row.port) ||
-        existing.certificate !== row.certificate
-    );
+    return existing.host !== row.hostname || String(existing.port) !== String(row.port);
+}
+
+function applyTlsSecretData(data) {
+    let count = 0;
+    if (data?.["ca.crt"]) {
+        tls_ca = Buffer.from(data["ca.crt"], "base64");
+        count += 1;
+    }
+    if (data?.["tls.crt"]) {
+        tls_cert = Buffer.from(data["tls.crt"], "base64");
+        count += 1;
+    }
+    if (data?.["tls.key"]) {
+        tls_key = Buffer.from(data["tls.key"], "base64");
+        count += 1;
+    }
+    if (count != 3) {
+        throw new Error(`Unexpected set of values from TLS secret data - expected 3, got ${count}`);
+    }
+}
+
+async function loadManageClientTls(client) {
+    const tls_result = await client.query("SELECT ObjectName FROM TlsCertificates WHERE Id = $1", [
+        controller_certificate_id,
+    ]);
+    if (tls_result.rowCount != 1) {
+        throw new Error(
+            `Expected to find a TlsCertificate record for ready controller: ${controller_certificate_id}`
+        );
+    }
+    const secret = await LoadSecret(tls_result.rows[0].objectname);
+    if (!secret?.data) {
+        throw new Error(`Missing TLS secret ${tls_result.rows[0].objectname}`);
+    }
+    const data = await overlayDualTrustCa(client, controller_certificate_id, secret.data);
+    applyTlsSecretData(data);
+}
+
+async function refreshManageTrustBundle() {
+    if (!controller_certificate_id || !tls_cert) {
+        return;
+    }
+    const client = await ClientFromPool("system");
+    try {
+        await loadManageClientTls(client);
+    } catch (err) {
+        Log(`WARN: Failed to refresh manage AMQP trust bundle: ${err.message}`);
+    } finally {
+        client.release();
+    }
 }
 
 async function createConnection(apid, row) {
@@ -53,7 +100,6 @@ async function createConnection(apid, row) {
         closing: false,
         host: row.hostname,
         port: row.port,
-        certificate: row.certificate,
         colocated: row.colocated,
     };
     manageConnections[apid] = rec;
@@ -174,42 +220,12 @@ async function resolveTLSData(renewal = false) {
         );
         if (result.rowCount == 1) {
             controller_certificate_id = result.rows[0].certificate;
-            const tls_result = await client.query(
-                "SELECT ObjectName FROM TlsCertificates WHERE Id = $1",
-                [controller_certificate_id]
-            );
-            if (tls_result.rowCount == 1) {
-                const secret = await LoadSecret(tls_result.rows[0].objectname);
-                let count = 0;
-                for (const [key, value] of Object.entries(secret.data)) {
-                    if (key == "ca.crt") {
-                        tls_ca = Buffer.from(value, "base64");
-                        count += 1;
-                    } else if (key == "tls.crt") {
-                        tls_cert = Buffer.from(value, "base64");
-                        count += 1;
-                    } else if (key == "tls.key") {
-                        tls_key = Buffer.from(value, "base64");
-                        count += 1;
-                    }
-                }
-
-                if (count != 3) {
-                    throw new Error(
-                        `Unexpected set of values from TLS secret data - expected 3, got ${count}`
-                    );
-                }
-
-                if (renewal) {
-                    await reconcileBackboneConnections();
-                } else {
-                    reschedule_delay = -1;
-                    setTimeout(reconcileBackboneConnections, 0);
-                }
+            await loadManageClientTls(client);
+            if (renewal) {
+                await reconcileBackboneConnections();
             } else {
-                throw new Error(
-                    `Expected to find a TlsCertificate record for ready controller: ${result.rows[0].certificate}`
-                );
+                reschedule_delay = -1;
+                setTimeout(reconcileBackboneConnections, 0);
             }
         }
         await client.query("COMMIT");
@@ -268,7 +284,14 @@ async function onAccessPointChange(action, id) {
 }
 
 async function onTlsCertificateChange(action, id) {
-    if (action != "UPDATE" || id != controller_certificate_id || !tls_cert) {
+    if (!tls_cert) {
+        return;
+    }
+    if (action == "ADD") {
+        await refreshManageTrustBundle();
+        return;
+    }
+    if (action != "UPDATE" || id != controller_certificate_id) {
         return;
     }
     Log(`Management controller TLS certificate renewed (${id}), reloading AMQP connections`);

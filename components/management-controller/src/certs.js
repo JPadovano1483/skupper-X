@@ -33,7 +33,6 @@ import {
 } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
 import { IsValidUuid } from "@vms/modules/util";
-import { X509Certificate } from "node:crypto";
 import { ClientFromPool, IntervalMilliseconds } from "./db.js";
 import {
     BackboneExpiration,
@@ -50,6 +49,7 @@ import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import {
+    expirationFromTlsSecret,
     lockLatestCertificateByObjectName,
     retargetParentCertificateFks,
     timestampsEqual,
@@ -646,10 +646,10 @@ async function secretAdded(dblink, secret) {
                 throw new Error("Unknown Target");
             }
             const cert_object = await LoadCertificate(secret.metadata.name);
-            const expiration = cert_object.status.notAfter
-                ? new Date(cert_object.status.notAfter)
-                : undefined;
-            const renewal = cert_object.status.renewalTime
+            const expiration =
+                expirationFromTlsSecret(secret) ||
+                (cert_object?.status?.notAfter ? new Date(cert_object.status.notAfter) : undefined);
+            const renewal = cert_object?.status?.renewalTime
                 ? new Date(cert_object.status.renewalTime)
                 : undefined;
             const signed_by = secret.metadata.annotations["skupper.io/vms-issuerlink"];
@@ -713,34 +713,20 @@ async function secretAdded(dblink, secret) {
             if (ref_table == "BackboneAccessPoints") {
                 await AccessPointCertReady(ref_id);
             }
+            return true;
         } else {
             //
             // There's been no meaningful action taken.  Roll back the transaction.
             //
             await client.query("ROLLBACK");
+            return false;
         }
     } catch (err) {
         Log(`Rolling back secret-added transaction: ${err.stack}`);
         await client.query("ROLLBACK");
+        return false;
     } finally {
         client.release();
-    }
-}
-
-function expirationFromTlsSecret(secret) {
-    const encoded = secret?.data?.["tls.crt"];
-    if (!encoded) {
-        return undefined;
-    }
-    try {
-        const pem = Buffer.from(encoded, "base64").toString("utf-8");
-        if (!pem.includes("BEGIN CERTIFICATE")) {
-            return undefined;
-        }
-        const x509 = new X509Certificate(pem);
-        return new Date(x509.validToDate ?? x509.validTo);
-    } catch {
-        return undefined;
     }
 }
 
@@ -835,8 +821,10 @@ function enqueueSecretRenewal(objectName, work) {
 // A managed secret tied to an existing TlsCertificate has been renewed in place.
 // Compare against the latest generation for this objectName (the kube dblink
 // annotation can lag after a failed retarget) and insert a superseding row when
-// expiration changes. Kubernetes writes happen after COMMIT so a 409 cannot
-// roll back the new generation.
+// expiration changes. A follow-up secret write with the same expiration (for
+// example after CA cascade records the new kube object) updates that row in
+// place. Kubernetes writes happen after COMMIT so a 409 cannot roll back the
+// new generation.
 //
 async function secretRenewed(secret) {
     const objectName = secret.metadata.name;
@@ -971,18 +959,21 @@ const onSecretWatch = function (action, secret) {
     if (!dblink) {
         return;
     }
-    switch (action) {
-        case "ADDED":
-            secretAdded(dblink, secret);
-            break;
-        case "MODIFIED": {
-            const objectName = secret.metadata.name;
-            if (shouldProcessSecretModification(objectName, secret.metadata.resourceVersion)) {
-                if (secret.data) {
-                    enqueueSecretRenewal(objectName, () => secretRenewed(secret));
-                }
+    const objectName = secret.metadata.name;
+    if (action == "ADDED") {
+        enqueueSecretRenewal(objectName, () => secretAdded(dblink, secret));
+        return;
+    }
+    if (action == "MODIFIED") {
+        if (shouldProcessSecretModification(objectName, secret.metadata.resourceVersion)) {
+            if (secret.data) {
+                enqueueSecretRenewal(objectName, async () => {
+                    const created = await secretAdded(dblink, secret);
+                    if (!created) {
+                        await secretRenewed(secret);
+                    }
+                });
             }
-            break;
         }
     }
 };
@@ -1064,8 +1055,6 @@ const certificateObject = function (
                 algorithm: "RSA",
                 encoding: "PKCS1",
                 size: 2048,
-                // CA key rotation invalidates all children; extend lifetime with the same key.
-                ...(is_ca ? { rotationPolicy: "Never" } : {}),
             },
             usages: [usage],
             issuerRef: {
@@ -1168,42 +1157,13 @@ async function syncAccessPointDnsNames(client, certId, objectName) {
     }
 }
 
-function setCaPrivateKeyRotationNever(cert) {
-    if (!cert) {
-        return null;
-    }
-    if (cert.spec?.privateKey?.rotationPolicy === "Never") {
-        return null;
-    }
-    return {
-        ...cert,
-        spec: {
-            ...cert.spec,
-            privateKey: {
-                ...cert.spec?.privateKey,
-                rotationPolicy: "Never",
-            },
-        },
-    };
-}
-
-async function ensureCaRotationPolicyNever(objectName) {
-    const kubeCert = await LoadCertificate(objectName);
-    const updated = setCaPrivateKeyRotationNever(kubeCert);
-    if (updated) {
-        await ReplaceCertificate(updated);
-    }
-}
-
 //
-// Force in-place cert-manager renewal for an existing TlsCertificates row.
-// CAs use rotationPolicy Never so renew extends notAfter without rotating the key.
-// Pass rotateKey: true to start a CA key-rotation cascade (new Issuer, dual-trust,
-// child re-issue) instead of a same-key lifetime extension.
-// Does not insert CertificateRequests — that would create a differently
-// named Certificate CR and break the current FK/secret model.
+// Rotate an existing TlsCertificates row.
+// Leaves: in-place cert-manager renewal of the current Certificate CR.
+// CAs: issue a new CA and Issuer, issue new Certificate objects for live
+// children, and keep dual trust until cutover (see rotateCaKey).
 //
-export async function RotateCertificate(cid, options = {}) {
+export async function RotateCertificate(cid) {
     if (!IsValidUuid(cid)) {
         throw httpError(400, `Malformed certificate ID: ${cid}`);
     }
@@ -1228,19 +1188,9 @@ export async function RotateCertificate(cid, options = {}) {
         if (superseded.rowCount > 0) {
             throw httpError(409, "Certificate has been superseded");
         }
-        if (options.rotateKey) {
-            if (!cert.isca) {
-                throw httpError(
-                    409,
-                    "CA key rotation is only supported for certificate authorities"
-                );
-            }
-        } else {
+        if (!cert.isca) {
             Log(`Triggering cert-manager renewal for ${cert.objectname} (${cid})`);
             try {
-                if (cert.isca) {
-                    await ensureCaRotationPolicyNever(cert.objectname);
-                }
                 await syncAccessPointDnsNames(client, cid, cert.objectname);
                 await TriggerCertificateRenewal(cert.objectname);
             } catch (err) {
@@ -1255,7 +1205,7 @@ export async function RotateCertificate(cid, options = {}) {
         client.release();
     }
 
-    const result = await rotateCaKey(cid, options);
+    const result = await rotateCaKey(cid);
     const refreshCertIds = result.refreshCertIds || [];
     for (const certId of refreshCertIds) {
         await SiteCertificateChanged(certId);
