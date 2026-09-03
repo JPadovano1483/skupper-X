@@ -43,7 +43,7 @@ import {
     CertOrganization,
 } from "./config.js";
 import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-management.js";
-import { certIdsToRefreshAfterIssuerCutover, rotateCaKey } from "./tls-ca-cascade.js";
+import { certIdsToRefreshAfterIssuerCutover, rotateCaCertificate } from "./tls-ca-cascade.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
 import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
@@ -806,6 +806,15 @@ function signedByForRenewal(secret, oldCert) {
     return issuerLink;
 }
 
+async function rotateCaWithNotifications(caId, options = {}) {
+    const result = await rotateCaCertificate(caId, options);
+    for (const certId of result.refreshCertIds || []) {
+        await SiteCertificateChanged(certId);
+        await AccessCertificateChanged(certId);
+    }
+    return result;
+}
+
 function enqueueSecretRenewal(objectName, work) {
     const previous = secretRenewalTail.get(objectName) || Promise.resolve();
     const next = previous.catch(() => {}).then(work);
@@ -842,6 +851,7 @@ async function secretRenewed(secret) {
     let currentId;
     let previousSignedBy;
     let renewedSignedBy;
+    let caRotationId;
     try {
         await client.query("BEGIN");
         const latest = await lockLatestCertificateByObjectName(client, objectName);
@@ -861,6 +871,10 @@ async function secretRenewed(secret) {
             notify.update("TlsCertificates", latest.id);
             await client.query("COMMIT");
             await notify.commit();
+        } else if (latest.isca) {
+            caRotationId = latest.id;
+            await client.query("ROLLBACK");
+            currentId = undefined;
         } else {
             const signedBy = signedByForRenewal(secret, latest);
             previousSignedBy = latest.signedby;
@@ -893,6 +907,19 @@ async function secretRenewed(secret) {
         currentId = undefined;
     } finally {
         client.release();
+    }
+
+    if (caRotationId) {
+        try {
+            await rotateCaWithNotifications(caRotationId);
+        } catch (err) {
+            if (err.statusCode === 409) {
+                Log(`CA rotation skipped for ${caRotationId}: ${err.message}`);
+            } else {
+                throw err;
+            }
+        }
+        return;
     }
 
     if (!currentId) {
@@ -1161,7 +1188,9 @@ async function syncAccessPointDnsNames(client, certId, objectName) {
 // Rotate an existing TlsCertificates row.
 // Leaves: in-place cert-manager renewal of the current Certificate CR.
 // CAs: issue a new CA and Issuer, issue new Certificate objects for live
-// children, and keep dual trust until cutover (see rotateCaKey).
+// children, and keep dual trust until cutover (see rotateCaKey). Automatic CA
+// renewal uses the same path when cert-manager renews the CA secret and
+// secretRenewed detects an expiration change.
 //
 export async function RotateCertificate(cid) {
     if (!IsValidUuid(cid)) {
@@ -1205,12 +1234,7 @@ export async function RotateCertificate(cid) {
         client.release();
     }
 
-    const result = await rotateCaKey(cid);
-    const refreshCertIds = result.refreshCertIds || [];
-    for (const certId of refreshCertIds) {
-        await SiteCertificateChanged(certId);
-        await AccessCertificateChanged(certId);
-    }
+    const result = await rotateCaWithNotifications(cid);
     const payload = { ...result };
     delete payload.refreshCertIds;
     return payload;

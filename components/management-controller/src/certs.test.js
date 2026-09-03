@@ -65,6 +65,7 @@ vi.mock("@vms/modules/kube", () => ({
 
 vi.mock("./tls-ca-cascade.js", () => ({
     rotateCaKey: vi.fn(),
+    rotateCaCertificate: vi.fn(),
     certIdsToRefreshAfterIssuerCutover: vi.fn(async () => []),
 }));
 
@@ -130,7 +131,7 @@ vi.mock("./notify.js", () => ({
 }));
 
 import { Start, RotateCertificate } from "./certs.js";
-import { rotateCaKey, certIdsToRefreshAfterIssuerCutover } from "./tls-ca-cascade.js";
+import { rotateCaCertificate, certIdsToRefreshAfterIssuerCutover } from "./tls-ca-cascade.js";
 import { RegisterNotification } from "./notify.js";
 import {
     ApplyObject,
@@ -1160,6 +1161,101 @@ describe("onSecretWatch", () => {
             expect.anything()
         );
     });
+
+    it("starts CA key rotation when a CA secret is renewed in place", async () => {
+        const oldCa = {
+            id: "ca-1",
+            isca: true,
+            objectname: "vms-bb-ca-1",
+            signedby: null,
+            expiration: new Date("2026-09-01T12:00:00.000Z"),
+            renewaltime: new Date("2026-08-01T12:00:00.000Z"),
+            rotationordinal: 0,
+            label: "Backbone: bb-1",
+        };
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-bb-ca-1", annotations: {} },
+            spec: { secretTemplate: { annotations: {} } },
+            status: {
+                notAfter: "2027-09-01T12:00:00.000Z",
+                renewalTime: "2027-08-01T12:00:00.000Z",
+            },
+        });
+        rotateCaCertificate.mockResolvedValue({
+            ...oldCa,
+            keyRotation: { newCertificateId: "ca-2", objectName: "vms-bb-ca-2", children: [] },
+            refreshCertIds: ["leaf-1"],
+        });
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (isLatestCertLockSql(sql)) {
+                return { rowCount: 1, rows: [oldCa] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        const secret = modifiedSecret("300");
+        secret.metadata.name = "vms-bb-ca-1";
+        secretWatchHandler("MODIFIED", secret);
+
+        await vi.waitFor(() => {
+            expect(rotateCaCertificate).toHaveBeenCalledWith("ca-1", {});
+            expect(SiteCertificateChanged).toHaveBeenCalledWith("leaf-1");
+            expect(AccessCertificateChanged).toHaveBeenCalledWith("leaf-1");
+        });
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("RotationOrdinal, Supercedes"),
+            expect.anything()
+        );
+        expect(ReplaceCertificate).not.toHaveBeenCalled();
+        expect(ReplaceSecret).not.toHaveBeenCalled();
+    });
+
+    it("ignores duplicate CA secret renewals after the CA is already superseded", async () => {
+        const oldCa = {
+            id: "ca-1",
+            isca: true,
+            objectname: "vms-bb-ca-1",
+            signedby: null,
+            expiration: new Date("2026-09-01T12:00:00.000Z"),
+            renewaltime: new Date("2026-08-01T12:00:00.000Z"),
+            rotationordinal: 0,
+            label: "Backbone: bb-1",
+        };
+        LoadCertificate.mockResolvedValue({
+            metadata: { name: "vms-bb-ca-1", annotations: {} },
+            spec: { secretTemplate: { annotations: {} } },
+            status: {
+                notAfter: "2027-09-01T12:00:00.000Z",
+                renewalTime: "2027-08-01T12:00:00.000Z",
+            },
+        });
+        const conflict = new Error("Certificate has been superseded");
+        conflict.statusCode = 409;
+        rotateCaCertificate.mockRejectedValue(conflict);
+        mockClient.query.mockImplementation(async (sql) => {
+            if (transactionSql(sql)) {
+                return {};
+            }
+            if (isLatestCertLockSql(sql)) {
+                return { rowCount: 1, rows: [oldCa] };
+            }
+            return { rowCount: 0, rows: [] };
+        });
+
+        const secret = modifiedSecret("301");
+        secret.metadata.name = "vms-bb-ca-1";
+        secretWatchHandler("MODIFIED", secret);
+        await vi.waitFor(() => {
+            expect(rotateCaCertificate).toHaveBeenCalledWith("ca-1", {});
+        });
+        expect(mockClient.query).not.toHaveBeenCalledWith(
+            expect.stringContaining("RotationOrdinal, Supercedes"),
+            expect.anything()
+        );
+    });
 });
 
 describe("RotateCertificate", () => {
@@ -1197,7 +1293,7 @@ describe("RotateCertificate", () => {
             [certId]
         );
         expect(TriggerCertificateRenewal).toHaveBeenCalledWith("vms-interior-cert-1");
-        expect(rotateCaKey).not.toHaveBeenCalled();
+        expect(rotateCaCertificate).not.toHaveBeenCalled();
         expect(LoadCertificate).not.toHaveBeenCalled();
         expect(ReplaceCertificate).not.toHaveBeenCalled();
         expect(mockClient.release).toHaveBeenCalled();
@@ -1231,7 +1327,7 @@ describe("RotateCertificate", () => {
             }
             return { rowCount: 1, rows: [caRow] };
         });
-        rotateCaKey.mockResolvedValue({
+        rotateCaCertificate.mockResolvedValue({
             ...caRow,
             keyRotation: { newCertificateId: "new-ca", objectName: "vms-bb-ca-new", children: [] },
             refreshCertIds: ["leaf-1"],
@@ -1241,7 +1337,7 @@ describe("RotateCertificate", () => {
             ...caRow,
             keyRotation: { newCertificateId: "new-ca", objectName: "vms-bb-ca-new", children: [] },
         });
-        expect(rotateCaKey).toHaveBeenCalledWith(certId);
+        expect(rotateCaCertificate).toHaveBeenCalledWith(certId, {});
         expect(SiteCertificateChanged).toHaveBeenCalledWith("leaf-1");
         expect(AccessCertificateChanged).toHaveBeenCalledWith("leaf-1");
         expect(TriggerCertificateRenewal).not.toHaveBeenCalled();

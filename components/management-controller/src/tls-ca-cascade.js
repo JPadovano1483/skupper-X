@@ -684,3 +684,7 @@ export async function rotateCaKey(oldCaId, options = {}) {
         isca: true,
     };
 }
+
+export async function rotateCaCertificate(caId, options = {}) {
+    return rotateCaKey(caId, options);
+}
