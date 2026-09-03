@@ -49,11 +49,7 @@ vi.mock("./sync-management.js", () => ({
     AccessCertificateChanged: vi.fn(async () => {}),
 }));
 
-import {
-    DeleteOrphanCertificates,
-    PruneNow,
-    reconcileCertificates,
-} from "./prune.js";
+import { DeleteOrphanCertificates, PruneNow, reconcileCertificates } from "./prune.js";
 import {
     GetIssuers,
     DeleteIssuer,

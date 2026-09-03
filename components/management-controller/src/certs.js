@@ -30,6 +30,9 @@ import {
     WatchSecrets,
     WatchCertificates,
     GetIssuers,
+    issuerObject,
+    kubeStatusCode,
+    httpError,
 } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
 import { IsValidUuid } from "@vms/modules/util";
@@ -46,7 +49,11 @@ import { SiteCertificateChanged, AccessCertificateChanged } from "./sync-managem
 import { certIdsToRefreshAfterIssuerCutover, rotateCaCertificate } from "./tls-ca-cascade.js";
 import { CompleteMember } from "./claim-server.js";
 import { AccessPointCertReady, SiteLifecycleChanged_TX } from "./site-deployment-state.js";
-import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
+import {
+    META_ANNOTATION_VMS_CONTROLLED,
+    META_ANNOTATION_VMS_DBLINK,
+    META_ANNOTATION_VMS_ISSUERLINK,
+} from "@vms/modules/common";
 import { NotifyTransaction, RegisterNotification } from "./notify.js";
 import {
     expirationFromTlsSecret,
@@ -652,7 +659,7 @@ async function secretAdded(dblink, secret) {
             const renewal = cert_object?.status?.renewalTime
                 ? new Date(cert_object.status.renewalTime)
                 : undefined;
-            const signed_by = secret.metadata.annotations["skupper.io/vms-issuerlink"];
+            const signed_by = secret.metadata.annotations[META_ANNOTATION_VMS_ISSUERLINK];
             const get_name = await client.query(`SELECT name FROM ${ref_table} WHERE Id = $1`, [
                 ref_id,
             ]);
@@ -793,10 +800,8 @@ async function retargetTlsDbLink(objectName, newId) {
     );
 }
 
-const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
-
 function signedByForRenewal(secret, oldCert) {
-    const issuerLink = secret.metadata?.annotations?.[ISSUER_LINK_ANNOTATION];
+    const issuerLink = secret.metadata?.annotations?.[META_ANNOTATION_VMS_ISSUERLINK];
     if (!issuerLink) {
         return oldCert.signedby;
     }
@@ -1069,7 +1074,7 @@ const certificateObject = function (
                 annotations: {
                     [META_ANNOTATION_VMS_CONTROLLED]: "true",
                     [META_ANNOTATION_VMS_DBLINK]: db_link,
-                    "skupper.io/vms-issuerlink": issuer_link,
+                    [META_ANNOTATION_VMS_ISSUERLINK]: issuer_link,
                 },
             },
             duration: `${duration_hours}h`,
@@ -1104,28 +1109,6 @@ const certificateObject = function (
 };
 
 //
-// Generate a cert-manager Issuer object from a template.
-//
-const issuerObject = function (name, db_link) {
-    return {
-        apiVersion: "cert-manager.io/v1",
-        kind: "Issuer",
-        metadata: {
-            name: name,
-            annotations: {
-                [META_ANNOTATION_VMS_DBLINK]: db_link,
-            },
-        },
-        spec: {
-            ca: {
-                secretName: name,
-            },
-            secretName: name,
-        },
-    };
-};
-
-//
 // ReconcileCertManager
 //
 // Returns true if cert-manager is fully operational on the cluster and false otherwise
@@ -1153,21 +1136,6 @@ const WatchCertManager = async function () {
         }
     }
 };
-
-function httpError(statusCode, message) {
-    const error = new Error(message);
-    error.statusCode = statusCode;
-    return error;
-}
-
-function kubeStatusCode(err) {
-    const direct = err?.statusCode || err?.code || err?.response?.statusCode;
-    if (typeof direct === "number") {
-        return direct;
-    }
-    const match = /HTTP-Code:\s*(\d+)/.exec(err?.message || "");
-    return match ? Number(match[1]) : direct;
-}
 
 async function syncAccessPointDnsNames(client, certId, objectName) {
     const apResult = await client.query(

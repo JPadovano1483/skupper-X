@@ -27,14 +27,20 @@ import {
     DeleteSecret,
     LoadCertificate,
     LoadSecret,
+    issuerObject,
+    kubeStatusCode,
+    httpError,
 } from "@vms/modules/kube";
 import { Log } from "@vms/modules/log";
-import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_VMS_DBLINK } from "@vms/modules/common";
+import {
+    META_ANNOTATION_VMS_CONTROLLED,
+    META_ANNOTATION_VMS_DBLINK,
+    META_ANNOTATION_VMS_ISSUERLINK,
+} from "@vms/modules/common";
 import { ClientFromPool } from "./db.js";
 import { NotifyTransaction } from "./notify.js";
 import { expirationFromTlsSecret, retargetParentCertificateFks } from "./tls-rotation.js";
 
-const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
 const DEFAULT_CA_DURATION = "8760h";
 const DEFAULT_SECRET_TIMEOUT_MS = 60_000;
 const DEFAULT_SECRET_INTERVAL_MS = 200;
@@ -44,21 +50,6 @@ const LIVE_CHILDREN_SQL =
     "WHERE SignedBy = $1 " +
     "AND NOT EXISTS (SELECT 1 FROM TlsCertificates newer WHERE newer.Supercedes = TlsCertificates.Id) " +
     "AND NOT EXISTS (SELECT 1 FROM TlsClientRevocations r WHERE r.CertificateId = TlsCertificates.Id)";
-
-function httpError(statusCode, message) {
-    const error = new Error(message);
-    error.statusCode = statusCode;
-    return error;
-}
-
-function kubeStatusCode(err) {
-    const direct = err?.statusCode || err?.code || err?.response?.statusCode;
-    if (typeof direct === "number") {
-        return direct;
-    }
-    const match = /HTTP-Code:\s*(\d+)/.exec(err?.message || "");
-    return match ? Number(match[1]) : direct;
-}
 
 function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -83,25 +74,6 @@ export function joinPemBundle(pems) {
     return `${parts.join("\n")}\n`;
 }
 
-function issuerObject(name, dbLink) {
-    return {
-        apiVersion: "cert-manager.io/v1",
-        kind: "Issuer",
-        metadata: {
-            name: name,
-            annotations: {
-                [META_ANNOTATION_VMS_DBLINK]: dbLink,
-            },
-        },
-        spec: {
-            ca: {
-                secretName: name,
-            },
-            secretName: name,
-        },
-    };
-}
-
 function newCaCertificateObject(oldCert, { name, dbLink, issuerName, issuerLink }) {
     return {
         apiVersion: "cert-manager.io/v1",
@@ -118,7 +90,7 @@ function newCaCertificateObject(oldCert, { name, dbLink, issuerName, issuerLink 
                 annotations: {
                     [META_ANNOTATION_VMS_CONTROLLED]: "true",
                     [META_ANNOTATION_VMS_DBLINK]: dbLink,
-                    [ISSUER_LINK_ANNOTATION]: issuerLink,
+                    [META_ANNOTATION_VMS_ISSUERLINK]: issuerLink,
                 },
             },
             duration: oldCert.spec?.duration || DEFAULT_CA_DURATION,
@@ -145,7 +117,7 @@ function newLeafCertificateObject(oldCert, { name, dbLink, issuerName, issuerLin
         ...(oldCert.spec?.secretTemplate?.annotations || {}),
         [META_ANNOTATION_VMS_CONTROLLED]: "true",
         [META_ANNOTATION_VMS_DBLINK]: dbLink,
-        [ISSUER_LINK_ANNOTATION]: issuerLink,
+        [META_ANNOTATION_VMS_ISSUERLINK]: issuerLink,
     };
     const commonName =
         oldCert.spec?.commonName && oldCert.spec.commonName !== oldCert.metadata?.name

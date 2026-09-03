@@ -22,11 +22,18 @@ import {
     Annotation,
     Controlled,
     Namespace,
+    httpError,
+    issuerObject,
+    kubeStatusCode,
     markCertificateForRenewal,
     setCertificateDnsName,
     setCertificateIssuerRef,
 } from "./kube.js";
-import { META_ANNOTATION_VMS_CONTROLLED, META_ANNOTATION_STATE_ID } from "./common.js";
+import {
+    META_ANNOTATION_VMS_CONTROLLED,
+    META_ANNOTATION_VMS_ISSUERLINK,
+    META_ANNOTATION_STATE_ID,
+} from "./common.js";
 
 describe("kube helpers", () => {
     it("Annotation reads metadata annotations", () => {
@@ -155,7 +162,26 @@ describe("kube helpers", () => {
             kind: "Issuer",
             group: "cert-manager.io",
         });
-        expect(updated.spec.secretTemplate.annotations["skupper.io/vms-issuerlink"]).toBe("new-ca");
+        expect(updated.spec.secretTemplate.annotations[META_ANNOTATION_VMS_ISSUERLINK]).toBe(
+            "new-ca"
+        );
+    });
+
+    it("issuerObject builds a cert-manager Issuer", () => {
+        const issuer = issuerObject("vms-bb-ca-1", "cert-id-1");
+        expect(issuer.metadata.name).toBe("vms-bb-ca-1");
+        expect(issuer.spec.ca.secretName).toBe("vms-bb-ca-1");
+    });
+
+    it("httpError attaches statusCode", () => {
+        const err = httpError(409, "conflict");
+        expect(err.message).toBe("conflict");
+        expect(err.statusCode).toBe(409);
+    });
+
+    it("kubeStatusCode parses HTTP-Code from message", () => {
+        expect(kubeStatusCode({ statusCode: 404 })).toBe(404);
+        expect(kubeStatusCode(new Error("HTTP-Code: 503 Service Unavailable"))).toBe(503);
     });
 
     it("setCertificateIssuerRef returns null when issuer already matches", () => {

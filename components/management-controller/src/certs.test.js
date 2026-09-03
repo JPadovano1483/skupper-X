@@ -31,37 +31,41 @@ let secretWatchHandler;
 /** @type {Array<{ method: string, table: string, id: string }>} */
 const notifyEvents = [];
 
-vi.mock("@vms/modules/kube", () => ({
-    ApplyObject: vi.fn(),
-    LoadCertificate: vi.fn(),
-    LoadSecret: vi.fn(),
-    TriggerCertificateRenewal: vi.fn(),
-    ReplaceCertificate: vi.fn(),
-    ReplaceSecret: vi.fn(),
-    setCertificateDnsName: vi.fn((cert, dnsName) => {
-        if (!dnsName) {
-            return null;
-        }
-        const current = cert.spec?.dnsNames;
-        if (Array.isArray(current) && current.length === 1 && current[0] === dnsName) {
-            return null;
-        }
-        return {
-            ...cert,
-            spec: {
-                ...cert.spec,
-                dnsNames: [dnsName],
-            },
-        };
-    }),
-    WatchSecrets: vi.fn((handler) => {
-        secretWatchHandler = handler;
-    }),
-    WatchCertificates: vi.fn(),
-    GetIssuers: vi.fn(async () => []),
-    DeleteSecret: vi.fn(),
-    DeleteCertificate: vi.fn(),
-}));
+vi.mock("@vms/modules/kube", async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+        ...actual,
+        ApplyObject: vi.fn(),
+        LoadCertificate: vi.fn(),
+        LoadSecret: vi.fn(),
+        TriggerCertificateRenewal: vi.fn(),
+        ReplaceCertificate: vi.fn(),
+        ReplaceSecret: vi.fn(),
+        setCertificateDnsName: vi.fn((cert, dnsName) => {
+            if (!dnsName) {
+                return null;
+            }
+            const current = cert.spec?.dnsNames;
+            if (Array.isArray(current) && current.length === 1 && current[0] === dnsName) {
+                return null;
+            }
+            return {
+                ...cert,
+                spec: {
+                    ...cert.spec,
+                    dnsNames: [dnsName],
+                },
+            };
+        }),
+        WatchSecrets: vi.fn((handler) => {
+            secretWatchHandler = handler;
+        }),
+        WatchCertificates: vi.fn(),
+        GetIssuers: vi.fn(async () => []),
+        DeleteSecret: vi.fn(),
+        DeleteCertificate: vi.fn(),
+    };
+});
 
 vi.mock("./tls-ca-cascade.js", () => ({
     rotateCaKey: vi.fn(),

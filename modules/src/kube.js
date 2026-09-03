@@ -206,14 +206,47 @@ export function setCertificateDnsName(cert, dnsName) {
     };
 }
 
-const ISSUER_LINK_ANNOTATION = "skupper.io/vms-issuerlink";
+export function kubeStatusCode(err) {
+    const direct = err?.statusCode || err?.code || err?.response?.statusCode;
+    if (typeof direct === "number") {
+        return direct;
+    }
+    const match = /HTTP-Code:\s*(\d+)/.exec(err?.message || "");
+    return match ? Number(match[1]) : direct;
+}
+
+export function httpError(statusCode, message) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
+export function issuerObject(name, dbLink) {
+    return {
+        apiVersion: "cert-manager.io/v1",
+        kind: "Issuer",
+        metadata: {
+            name: name,
+            annotations: {
+                [common.META_ANNOTATION_VMS_DBLINK]: dbLink,
+            },
+        },
+        spec: {
+            ca: {
+                secretName: name,
+            },
+            secretName: name,
+        },
+    };
+}
 
 export function setCertificateIssuerRef(cert, issuerName, issuerLink) {
     if (!cert || !issuerName) {
         return null;
     }
     const currentName = cert.spec?.issuerRef?.name;
-    const currentLink = cert.spec?.secretTemplate?.annotations?.[ISSUER_LINK_ANNOTATION];
+    const currentLink =
+        cert.spec?.secretTemplate?.annotations?.[common.META_ANNOTATION_VMS_ISSUERLINK];
     if (currentName === issuerName && (!issuerLink || currentLink === issuerLink)) {
         return null;
     }
@@ -231,7 +264,7 @@ export function setCertificateIssuerRef(cert, issuerName, issuerLink) {
                 ...cert.spec?.secretTemplate,
                 annotations: {
                     ...cert.spec?.secretTemplate?.annotations,
-                    ...(issuerLink ? { [ISSUER_LINK_ANNOTATION]: issuerLink } : {}),
+                    ...(issuerLink ? { [common.META_ANNOTATION_VMS_ISSUERLINK]: issuerLink } : {}),
                 },
             },
         },

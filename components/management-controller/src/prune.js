@@ -31,7 +31,11 @@ import { Log } from "@vms/modules/log";
 import { META_ANNOTATION_VMS_CONTROLLED } from "@vms/modules/common";
 import { ClientFromPool } from "./db.js";
 import { NotifyTransaction } from "./notify.js";
-import { deleteExpiredSupersededCertificates, getCurrentCertificateId } from "./tls-rotation.js";
+import {
+    deleteExpiredSupersededCertificates,
+    getCurrentCertificateId,
+    TLS_CERTIFICATE_PARENT_TABLES,
+} from "./tls-rotation.js";
 import { AccessCertificateChanged, SiteCertificateChanged } from "./sync-management.js";
 
 function uniqueObjectNames(objectNames) {
@@ -126,16 +130,7 @@ export async function DeleteOrphanCertificates() {
             }
         }
 
-        for (const table of [
-            "ManagementControllers",
-            "Backbones",
-            "BackboneAccessPoints",
-            "InteriorSites",
-            "ApplicationNetworks",
-            "NetworkCredentials",
-            "MemberInvitations",
-            "MemberSites",
-        ]) {
+        for (const table of TLS_CERTIFICATE_PARENT_TABLES) {
             const result = await client.query(`SELECT Id, Certificate FROM ${table}`);
             for (const row of result.rows) {
                 if (row.certificate) {
